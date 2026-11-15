@@ -72,6 +72,13 @@ def diebold_mariano_test(loss_a: np.ndarray, loss_b: np.ndarray, h: int = 5) -> 
     return d_bar, t_stat
 
 
+def mean_std(values: List[float]) -> Tuple[float, float]:
+    """Mean and sample std (ddof=1) across seeds; std=0.0 for a single seed."""
+    arr = np.asarray(values, dtype=np.float64)
+    std = float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+    return float(arr.mean()), std
+
+
 # ============================================================================
 # 2. SYNTHETIC STATE-FUNCTION & MULTI-TIMESCALE ENVIRONMENT
 # ============================================================================
@@ -110,10 +117,17 @@ def transition_function(state_t: np.ndarray, action_t: np.ndarray, asset_beta: f
     return np.array([l_next, m_next, p_next], dtype=np.float32)
 
 
-def generate_panel_with_interventions(cfg: SimConfig, seed: int = 0) -> Dict[str, np.ndarray]:
+def generate_panel_with_interventions(
+    cfg: SimConfig,
+    seed: int = 0,
+    state_noise: Tuple[float, float, float] = (0.06, 0.05, 0.03),
+) -> Dict[str, np.ndarray]:
     """
     Simulates a panel of assets with latent multi-scale states and daily functional
     interventions u_t, plus 8 observable Study-3-style features.
+    state_noise: per-coordinate std of the Gaussian process noise on the latent
+    state transition (l, m, p). Default is the original medium level; the ablation
+    sweep varies it without changing the default stream.
     """
     rng = np.random.default_rng(seed)
     N, T = cfg.n_assets, cfg.n_days
@@ -138,7 +152,7 @@ def generate_panel_with_interventions(cfg: SimConfig, seed: int = 0) -> Dict[str
             returns[i, t] = r_t
 
             s_det = transition_function(s, a_t, asset_betas[i])
-            noise = rng.normal([0.0, 0.0, 0.0], [0.06, 0.05, 0.03]).astype(np.float32)
+            noise = rng.normal([0.0, 0.0, 0.0], list(state_noise)).astype(np.float32)
             s = s_det + noise
 
         r = returns[i]
@@ -576,10 +590,17 @@ def within_asset_r2(y_true: np.ndarray, y_pred: np.ndarray, asset_ids: np.ndarra
 # 5. EXPERIMENT 1: FUNCTION / STATE-TRANSITION REPLICATION
 # ============================================================================
 
-def run_experiment_1_state_transition(panel: Dict[str, np.ndarray], device: str = "cpu"):
-    print("=" * 88)
+def run_experiment_1_state_transition(
+    panel: Dict[str, np.ndarray],
+    device: str = "cpu",
+    seeds: Tuple[int, ...] = (0, 1, 2),
+):
+    print("=" * 100)
     print("EXPERIMENT 1: CAN JEPA + TabICL REPLICATE DAILY STATE-TRANSITION FUNCTIONS g(s_t, a_t)?")
-    print("=" * 88)
+    print(f"Protocol: {len(seeds)} seeds {tuple(seeds)}; mean ± sample std across seeds.")
+    print("Panel (seed 2026) and counterfactual actions (rng 123) fixed; seeds vary encoder init,")
+    print("JEPA training, and probe fits. Seed 0 reproduces the original single-run protocol.")
+    print("=" * 100)
     data = build_horizon_dataset(panel, context_len=40, horizon=5, train_end_day=1000)
 
     X_ctx_tr, X_fut_tr, act_tr = data["X_ctx_train"], data["X_fut_train"], data["act_train"]
@@ -599,82 +620,97 @@ def run_experiment_1_state_transition(panel: Dict[str, np.ndarray], device: str 
         for k in range(len(s_curr_te))
     ])
 
-    set_seed(0)
-    untrained_enc = TimeSeriesEncoder(mag_preserving=True).to(device)
-    untrained_pred = LatentPredictor(embed_dim=untrained_enc.out_dim, action_dim=0).to(device)
-    Z_untrained_tr = extract_representations(untrained_enc, untrained_pred, X_ctx_tr, device=device)
-    Z_untrained_te = extract_representations(untrained_enc, untrained_pred, X_ctx_te, device=device)
+    metrics: Dict[str, Dict[str, List[float]]] = {}
 
-    jepa_std_enc, jepa_std_pred = train_jepa_model(
-        X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=False,
-        use_cluster_sampler=True, mag_preserving=True, epochs=10, seed=0, device=device
-    )
-    Z_jepa_std_tr = extract_representations(jepa_std_enc, jepa_std_pred, X_ctx_tr, device=device)
-    Z_jepa_std_te = extract_representations(jepa_std_enc, jepa_std_pred, X_ctx_te, device=device)
+    for seed in seeds:
+        set_seed(seed)
+        untrained_enc = TimeSeriesEncoder(mag_preserving=True).to(device)
+        untrained_pred = LatentPredictor(embed_dim=untrained_enc.out_dim, action_dim=0).to(device)
+        Z_untrained_tr = extract_representations(untrained_enc, untrained_pred, X_ctx_tr, device=device)
+        Z_untrained_te = extract_representations(untrained_enc, untrained_pred, X_ctx_te, device=device)
 
-    jepa_act_enc, jepa_act_pred = train_jepa_model(
-        X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=True,
-        use_cluster_sampler=True, mag_preserving=True, epochs=10, seed=0, device=device
-    )
-    Z_jepa_act_tr = extract_representations(jepa_act_enc, jepa_act_pred, X_ctx_tr, act_tr, use_action=True, device=device)
-    Z_jepa_act_te = extract_representations(jepa_act_enc, jepa_act_pred, X_ctx_te, act_te, use_action=True, device=device)
-    Z_jepa_act_cf = extract_representations(jepa_act_enc, jepa_act_pred, X_ctx_te, a_cf, use_action=True, device=device)
-    Z_jepa_act_zero = extract_representations(jepa_act_enc, jepa_act_pred, X_ctx_te, a_zero, use_action=True, device=device)
-
-    models_exp1 = [
-        (
-            "A. Untrained Encoder [z_t, a_t] + Ridge", "ridge",
-            np.hstack([Z_untrained_tr, act_tr]),
-            [np.hstack([Z_untrained_te, act_te]), np.hstack([Z_untrained_te, a_cf]), np.hstack([Z_untrained_te, a_zero])]
-        ),
-        (
-            "A. Untrained Encoder [z_t, a_t] + TabICL", "tabicl",
-            np.hstack([Z_untrained_tr, act_tr]),
-            [np.hstack([Z_untrained_te, act_te]), np.hstack([Z_untrained_te, a_cf]), np.hstack([Z_untrained_te, a_zero])]
-        ),
-        (
-            "D. Standard JEPA [z_t, a_t] + TabICL", "tabicl",
-            np.hstack([Z_jepa_std_tr, act_tr]),
-            [np.hstack([Z_jepa_std_te, act_te]), np.hstack([Z_jepa_std_te, a_cf]), np.hstack([Z_jepa_std_te, a_zero])]
-        ),
-        (
-            "E. Action-JEPA P(z_t, a_t) + Ridge", "ridge",
-            Z_jepa_act_tr,
-            [Z_jepa_act_te, Z_jepa_act_cf, Z_jepa_act_zero]
-        ),
-        (
-            "E. Action-JEPA [P(z_t, a_t), a_t] + TabICL", "tabicl",
-            np.hstack([Z_jepa_act_tr, act_tr]),
-            [np.hstack([Z_jepa_act_te, act_te]), np.hstack([Z_jepa_act_cf, a_cf]), np.hstack([Z_jepa_act_zero, a_zero])]
-        ),
-    ]
-
-    print(f"{'Model Variant':<44} | {'Pooled State R²':>15} | {'Within-Asset R²':>15} | {'Transition MSE':>14}")
-    print("-" * 96)
-    for name, p_type, F_tr, F_te_list in models_exp1:
-        pred_obs, pred_cf, pred_zero = fit_probe_once_predict_many(
-            F_tr, s_det1_tr, F_te_list, probe_type=p_type, support_stride=5, seed=0
+        jepa_std_enc, jepa_std_pred = train_jepa_model(
+            X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=False,
+            use_cluster_sampler=True, mag_preserving=True, epochs=10, seed=seed, device=device
         )
-        r2_pool = r2_score(s_det1_te, pred_obs)
-        r2_within = within_asset_r2(s_det1_te, pred_obs, asset_te)
-        mse_val = mean_squared_error(s_det1_te, pred_obs)
-        print(f"{name:<44} | {r2_pool:>15.4f} | {r2_within:>15.4f} | {mse_val:>14.4f}")
+        Z_jepa_std_tr = extract_representations(jepa_std_enc, jepa_std_pred, X_ctx_tr, device=device)
+        Z_jepa_std_te = extract_representations(jepa_std_enc, jepa_std_pred, X_ctx_te, device=device)
+
+        jepa_act_enc, jepa_act_pred = train_jepa_model(
+            X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=True,
+            use_cluster_sampler=True, mag_preserving=True, epochs=10, seed=seed, device=device
+        )
+        Z_jepa_act_tr = extract_representations(jepa_act_enc, jepa_act_pred, X_ctx_tr, act_tr, use_action=True, device=device)
+        Z_jepa_act_te = extract_representations(jepa_act_enc, jepa_act_pred, X_ctx_te, act_te, use_action=True, device=device)
+        Z_jepa_act_cf = extract_representations(jepa_act_enc, jepa_act_pred, X_ctx_te, a_cf, use_action=True, device=device)
+        Z_jepa_act_zero = extract_representations(jepa_act_enc, jepa_act_pred, X_ctx_te, a_zero, use_action=True, device=device)
+
+        models_exp1 = [
+            (
+                "A. Untrained Encoder [z_t, a_t] + Ridge", "ridge",
+                np.hstack([Z_untrained_tr, act_tr]),
+                [np.hstack([Z_untrained_te, act_te]), np.hstack([Z_untrained_te, a_cf]), np.hstack([Z_untrained_te, a_zero])]
+            ),
+            (
+                "A. Untrained Encoder [z_t, a_t] + TabICL", "tabicl",
+                np.hstack([Z_untrained_tr, act_tr]),
+                [np.hstack([Z_untrained_te, act_te]), np.hstack([Z_untrained_te, a_cf]), np.hstack([Z_untrained_te, a_zero])]
+            ),
+            (
+                "D. Standard JEPA [z_t, a_t] + TabICL", "tabicl",
+                np.hstack([Z_jepa_std_tr, act_tr]),
+                [np.hstack([Z_jepa_std_te, act_te]), np.hstack([Z_jepa_std_te, a_cf]), np.hstack([Z_jepa_std_te, a_zero])]
+            ),
+            (
+                "E. Action-JEPA P(z_t, a_t) + Ridge", "ridge",
+                Z_jepa_act_tr,
+                [Z_jepa_act_te, Z_jepa_act_cf, Z_jepa_act_zero]
+            ),
+            (
+                "E. Action-JEPA [P(z_t, a_t), a_t] + TabICL", "tabicl",
+                np.hstack([Z_jepa_act_tr, act_tr]),
+                [np.hstack([Z_jepa_act_te, act_te]), np.hstack([Z_jepa_act_cf, a_cf]), np.hstack([Z_jepa_act_zero, a_zero])]
+            ),
+        ]
+
+        for name, p_type, F_tr, F_te_list in models_exp1:
+            pred_obs, _, _ = fit_probe_once_predict_many(
+                F_tr, s_det1_tr, F_te_list, probe_type=p_type, support_stride=5, seed=seed
+            )
+            if name not in metrics:
+                metrics[name] = {"pool": [], "within": [], "mse": []}
+            metrics[name]["pool"].append(r2_score(s_det1_te, pred_obs))
+            metrics[name]["within"].append(within_asset_r2(s_det1_te, pred_obs, asset_te))
+            metrics[name]["mse"].append(mean_squared_error(s_det1_te, pred_obs))
+
+    header = f"{'Model Variant':<44} | {'Pooled State R²':>16} | {'Within-Asset R²':>16} | {'Transition MSE':>16}"
+    print(header)
+    print("-" * len(header))
+    for name, m in metrics.items():
+        m_pool, s_pool = mean_std(m["pool"])
+        m_with, s_with = mean_std(m["within"])
+        m_mse, s_mse = mean_std(m["mse"])
+        print(
+            f"{name:<44} | {m_pool:>9.4f}±{s_pool:.4f} | {m_with:>9.4f}±{s_with:.4f} | {m_mse:>9.4f}±{s_mse:.4f}"
+        )
 
 
 # ============================================================================
 # 6. EXPERIMENT 2: TIMESCALE SWEEP (H in {1, 5, 22, 60} DAYS)
 # ============================================================================
 
-def run_experiment_2_timescale_sweep(panel: Dict[str, np.ndarray], horizons: List[int] = [1, 5, 22, 60], device: str = "cpu"):
-    print("\n" + "=" * 88)
+def run_experiment_2_timescale_sweep(
+    panel: Dict[str, np.ndarray],
+    horizons: List[int] = [1, 5, 22, 60],
+    device: str = "cpu",
+    seeds: Tuple[int, ...] = (42, 43, 44),
+):
+    print("\n" + "=" * 118)
     print("EXPERIMENT 2: HOW REPRESENTATION RANK & ACCURACY CHANGE ACROSS TIMESCALES (H = 1, 5, 22, 60)")
-    print("=" * 88)
-    header = (
-        f"{'Horizon H':<10} | {'Variant':<28} | {'Eff. Rank':>9} | "
-        f"{'RV Pooled R²':>12} | {'RV Within R²':>12} | {'State H R²':>10} | {'DM vs Untrained (t)':>20}"
-    )
-    print(header)
-    print("-" * len(header))
+    print(f"Protocol: {len(seeds)} seeds {tuple(seeds)}; mean ± sample std across seeds.")
+    print("Panel (seed 2026) fixed; seeds vary encoder init, JEPA training, and probe fits. Each seed's")
+    print("DM test uses that seed's untrained encoder as baseline. Seed 42 reproduces the original protocol.")
+    print("=" * 118)
 
     for H in horizons:
         data = build_horizon_dataset(panel, context_len=40, horizon=H, train_end_day=1000)
@@ -683,73 +719,99 @@ def run_experiment_2_timescale_sweep(panel: Dict[str, np.ndarray], horizons: Lis
         y_rv_tr, y_rv_te = data["y_rv_train"], data["y_rv_test"]
         s_hor_tr, s_hor_te = data["s_hor_train"], data["s_hor_test"]
         asset_te, date_te = data["asset_test"], data["date_test"]
+        unique_dates = np.unique(date_te)
 
-        set_seed(42)
-        enc_A = TimeSeriesEncoder(mag_preserving=True).to(device)
-        pred_A = LatentPredictor(embed_dim=enc_A.out_dim, action_dim=0).to(device)
-        Z_A_tr = extract_representations(enc_A, pred_A, X_ctx_tr, device=device)
-        Z_A_te = extract_representations(enc_A, pred_A, X_ctx_te, device=device)
+        metrics: Dict[str, Dict[str, List[float]]] = {}
 
-        enc_C, pred_C = train_jepa_model(
-            X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=False,
-            use_cluster_sampler=False, mag_preserving=True, epochs=10, seed=42, device=device
-        )
-        Z_C_tr = extract_representations(enc_C, pred_C, X_ctx_tr, device=device)
-        Z_C_te = extract_representations(enc_C, pred_C, X_ctx_te, device=device)
+        for seed in seeds:
+            set_seed(seed)
+            enc_A = TimeSeriesEncoder(mag_preserving=True).to(device)
+            pred_A = LatentPredictor(embed_dim=enc_A.out_dim, action_dim=0).to(device)
+            Z_A_tr = extract_representations(enc_A, pred_A, X_ctx_tr, device=device)
+            Z_A_te = extract_representations(enc_A, pred_A, X_ctx_te, device=device)
 
-        enc_D, pred_D = train_jepa_model(
-            X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=False,
-            use_cluster_sampler=True, mag_preserving=True, epochs=10, seed=42, device=device
-        )
-        Z_D_tr = extract_representations(enc_D, pred_D, X_ctx_tr, device=device)
-        Z_D_te = extract_representations(enc_D, pred_D, X_ctx_te, device=device)
-
-        enc_E, pred_E = train_jepa_model(
-            X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=True,
-            use_cluster_sampler=True, mag_preserving=True, epochs=10, seed=42, device=device
-        )
-        Z_E_tr = extract_representations(enc_E, pred_E, X_ctx_tr, act_tr, use_action=True, device=device)
-        Z_E_te = extract_representations(enc_E, pred_E, X_ctx_te, act_te, use_action=True, device=device)
-
-        variants = [
-            ("A. Untrained + TabICL", Z_A_tr, Z_A_te),
-            ("C. JEPA Uniform + TabICL", Z_C_tr, Z_C_te),
-            ("D. JEPA Cluster + TabICL", Z_D_tr, Z_D_te),
-            ("E. Action-JEPA + TabICL", Z_E_tr, Z_E_te),
-        ]
-
-        loss_by_date_A = None
-        for v_name, Z_tr, Z_te in variants:
-            erank = compute_effective_rank(Z_te)
-            y_hat = fit_predict_probe(
-                np.hstack([Z_tr, act_tr]), y_rv_tr,
-                np.hstack([Z_te, act_te]), probe_type="tabicl",
-                support_stride=max(1, H // 2), seed=42
+            enc_C, pred_C = train_jepa_model(
+                X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=False,
+                use_cluster_sampler=False, mag_preserving=True, epochs=10, seed=seed, device=device
             )
-            r2_pool = r2_score(y_rv_te, y_hat)
-            r2_with = within_asset_r2(y_rv_te, y_hat, asset_te)
+            Z_C_tr = extract_representations(enc_C, pred_C, X_ctx_tr, device=device)
+            Z_C_te = extract_representations(enc_C, pred_C, X_ctx_te, device=device)
 
-            s_hat = fit_predict_probe(
-                np.hstack([Z_tr, act_tr]), s_hor_tr,
-                np.hstack([Z_te, act_te]), probe_type="tabicl",
-                support_stride=max(1, H // 2), seed=42
+            enc_D, pred_D = train_jepa_model(
+                X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=False,
+                use_cluster_sampler=True, mag_preserving=True, epochs=10, seed=seed, device=device
             )
-            r2_state = within_asset_r2(s_hor_te, s_hat, asset_te)
+            Z_D_tr = extract_representations(enc_D, pred_D, X_ctx_tr, device=device)
+            Z_D_te = extract_representations(enc_D, pred_D, X_ctx_te, device=device)
 
-            sq_err = (y_rv_te - y_hat) ** 2
-            unique_dates = np.unique(date_te)
-            date_losses = np.array([np.mean(sq_err[date_te == d]) for d in unique_dates])
+            enc_E, pred_E = train_jepa_model(
+                X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=True,
+                use_cluster_sampler=True, mag_preserving=True, epochs=10, seed=seed, device=device
+            )
+            Z_E_tr = extract_representations(enc_E, pred_E, X_ctx_tr, act_tr, use_action=True, device=device)
+            Z_E_te = extract_representations(enc_E, pred_E, X_ctx_te, act_te, use_action=True, device=device)
 
-            if loss_by_date_A is None:
-                loss_by_date_A = date_losses
-                dm_str = "baseline"
+            variants = [
+                ("A. Untrained + TabICL", Z_A_tr, Z_A_te),
+                ("C. JEPA Uniform + TabICL", Z_C_tr, Z_C_te),
+                ("D. JEPA Cluster + TabICL", Z_D_tr, Z_D_te),
+                ("E. Action-JEPA + TabICL", Z_E_tr, Z_E_te),
+            ]
+
+            loss_by_date_A = None
+            for v_name, Z_tr, Z_te in variants:
+                erank = compute_effective_rank(Z_te)
+                y_hat = fit_predict_probe(
+                    np.hstack([Z_tr, act_tr]), y_rv_tr,
+                    np.hstack([Z_te, act_te]), probe_type="tabicl",
+                    support_stride=max(1, H // 2), seed=seed
+                )
+                r2_pool = r2_score(y_rv_te, y_hat)
+                r2_with = within_asset_r2(y_rv_te, y_hat, asset_te)
+
+                s_hat = fit_predict_probe(
+                    np.hstack([Z_tr, act_tr]), s_hor_tr,
+                    np.hstack([Z_te, act_te]), probe_type="tabicl",
+                    support_stride=max(1, H // 2), seed=seed
+                )
+                r2_state = within_asset_r2(s_hor_te, s_hat, asset_te)
+
+                sq_err = (y_rv_te - y_hat) ** 2
+                date_losses = np.array([np.mean(sq_err[date_te == d]) for d in unique_dates])
+
+                if v_name not in metrics:
+                    metrics[v_name] = {"erank": [], "pool": [], "within": [], "state": [], "dm_t": []}
+                metrics[v_name]["erank"].append(erank)
+                metrics[v_name]["pool"].append(r2_pool)
+                metrics[v_name]["within"].append(r2_with)
+                metrics[v_name]["state"].append(r2_state)
+
+                if loss_by_date_A is None:
+                    loss_by_date_A = date_losses
+                else:
+                    _, t_stat = diebold_mariano_test(date_losses, loss_by_date_A, h=H)
+                    metrics[v_name]["dm_t"].append(t_stat)
+
+        header = (
+            f"{'Horizon H':<10} | {'Variant':<28} | {'Eff. Rank':>13} | "
+            f"{'RV Pooled R²':>15} | {'RV Within R²':>15} | {'State H R²':>15} | {'DM t vs Untrained':>17}"
+        )
+        print(header)
+        print("-" * len(header))
+        for v_name, m in metrics.items():
+            m_er, s_er = mean_std(m["erank"])
+            m_pool, s_pool = mean_std(m["pool"])
+            m_with, s_with = mean_std(m["within"])
+            m_state, s_state = mean_std(m["state"])
+            if m["dm_t"]:
+                m_t, s_t = mean_std(m["dm_t"])
+                dm_str = f"{m_t:+.2f}±{s_t:.2f}"
             else:
-                d_bar, t_stat = diebold_mariano_test(date_losses, loss_by_date_A, h=H)
-                dm_str = f"{d_bar:+.4f} ({t_stat:+.2f})"
-
+                dm_str = "baseline"
             print(
-                f"H = {H:<6d} | {v_name:<28} | {erank:>9.2f} | "
-                f"{r2_pool:>12.4f} | {r2_with:>12.4f} | {r2_state:>10.4f} | {dm_str:>20}"
+                f"H = {H:<6d} | {v_name:<28} | {m_er:>7.2f}±{s_er:.2f} | "
+                f"{m_pool:>8.4f}±{s_pool:.4f} | {m_with:>8.4f}±{s_with:.4f} | "
+                f"{m_state:>8.4f}±{s_state:.4f} | {dm_str:>17}"
             )
         print("-" * len(header))
 
