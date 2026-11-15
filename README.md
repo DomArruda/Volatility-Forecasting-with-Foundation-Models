@@ -123,7 +123,7 @@ This repository provides the full reproducible code and controlled benchmarks fo
 ## Quickstart & Installation
 
 ```bash
-git clone https://github.com/DomArruda/Volatility-Forecasting-with-Foundational-Models.git
+git clone https://github.com/DomArruda/Volatility-Forecasting-with-Foundation-Models.git
 cd jepa-tabicl-volatility
 pip install -r requirements.txt
 python scripts/study3_state_timescale_experiments.py
