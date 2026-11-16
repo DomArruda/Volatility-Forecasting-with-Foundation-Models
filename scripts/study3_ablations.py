@@ -1,5 +1,6 @@
 """
-Study 3 - Targeted Ablations (extends, and does not modify, the original Study-3 codebase).
+Study 3 - Targeted Ablations and Decision Experiments (extends, and does not modify,
+the original Study-3 codebase).
 
 SELF-CONTAINED GOOGLE-COLAB RUNNER: this single file embeds verbatim copies of the
 existing Study-3 utilities (encoder, JEPA training loop, probes, metrics, data
@@ -7,68 +8,78 @@ generation) so it runs with NO other files present. The originals in
 scripts/study3_state_timescale_experiments.py remain the reference implementation;
 keep the copies below in sync with it.
 
-ABLATION A: Does the structure of the untrained Conv+Transformer matter, or would any
-    high-dimensional random projection of the same size work just as well?
-    -> RandomLinearProjector (frozen random matrix, out_dim=33) vs Untrained Conv+Transformer
-       vs JEPA Cluster on the fixed medium-noise, H=5 setting, read out by Ridge AND TabICL.
+ABLATION A (Table 1): does the structure of the untrained Conv+Transformer matter, or would
+    any random projection of the same width work? Random linear projection (out_dim=33) vs
+    untrained Conv+Transformer vs JEPA Cluster; medium noise, H=5; Ridge and TabICL probes.
 
-ABLATION B: How quickly does recovery of higher-order (1st/2nd/3rd-order) latent state
-    features degrade as forecast horizon (H in {1,5,10,22}) and process noise
-    (low/medium/high on the latent state transition) increase?
-    -> Full horizon x noise x order within-asset R^2 matrix for the three extractors,
-       read out by a fixed-capacity Ridge probe, plus effective rank.
+ABLATION B (Table 2): how fast does recovery of 1st/2nd/3rd-order latent-state terms degrade
+    with horizon H in {1,5,10,22} and process noise {low, medium, high}? Ridge probe.
 
-EXPERIMENT C (belief-space planning): if the representation really contains the state
-    machine, it should support decisions, not just probes. For each test context we
-    enumerate a 27-point action grid and form a BELIEF over the next state from a
-    5-member ensemble of Action-JEPA predictors (vs. 5 untrained encoders): the ensemble
-    mean is the expected dynamics, the ensemble spread is the estimated risk. A
-    safety-first policy first removes actions whose estimated P(dangerous log-vol state)
-    exceeds a tolerance (belief-space filtering, cf. UWM-JEPA), then maximizes the
-    conditional Sharpe E[r']/vol' among the survivors. Because the DGP is known, every
-    policy is scored against the oracle: true regret, % optimal actions, and % of
-    dangerous states actually entered.
+    Ablations A and B use the ORIGINAL DGP, so they line up with Experiments 1-2.
+
+DECISION EXPERIMENTS C-G use the DECISION DGP (--decision-dgp, default "centered").
+    In the original DGP the drift equation couples to the raw log-vol level,
+    tanh(a_regime + 0.3 l); with l around -4.7 that pins the drift m below zero in every
+    state, so the conditional Sharpe m/vol is always negative and is maximized by RAISING
+    vol. It also leaves ~40% of states below the vol clip floor (l < -4.5), where returns
+    carry no information about l. The centered DGP couples to the asset's own baseline,
+    tanh(a_regime + 0.3 (l - beta)); everything else in g is unchanged. Each run prints
+    both panels' diagnostics. Measured at the default panel (medium noise): drift < 0 in
+    100% -> 34% of states; vol clipped in 40% (all at the floor) -> 26% (7% floor, 19%
+    ceiling, l > 1). The log-vol spread itself is wide in both DGPs; bounding it would
+    need a further change to g and is left as a modeling choice. "--decision-dgp original" runs C-G on the v3 DGP (numbers
+    differ slightly from v3 because of the fixes below).
+
+EXPERIMENT C (Table 3, belief-space planning): 27-point action grid; 5-member ensembles form a
+    belief over the next state (mean = expected dynamics, spread = epistemic risk). Three
+    readouts: Action-JEPA predictor P(z, a); the same trained Action-JEPA ENCODER read out
+    linearly in the action [z, a] (control that separates "representation" from "nonlinear
+    action pathway"); untrained encoder read out on [z, a]. Risk-neutral and safety-first
+    (filter P(dangerous) <= tol, then max conditional Sharpe) policies, scored against the
+    oracle built from the true g.
+
+EXPERIMENT D (Table 4, portfolio allocation): long-only mean-variance allocation with a 25%
+    cap, rebalanced every H=5 days. Every strategy solves the SAME QP,
+        max_w  w'mu - 0.5 w'diag(var) w   s.t.  sum(w) = 1, 0 <= w <= cap,
+    exactly; the oracle plugs in the true moments (computed from the realized future DGP
+    states), so regret vs oracle is >= 0 by construction.
+
+EXPERIMENT E (Table 5, LP decision-complexity scaling): max_w w'mu_hat s.t. sum(w)=1,
+    0 <= w <= 2/n, for n in {2,4,8,16,20}; regret vs the LP on true expected returns.
+
+EXPERIMENT F (Table 6, RL emulation): the MDP induced by g (27 actions, process noise,
+    reward = conditional Sharpe of the next state, gamma = 0.9) is solved by value iteration
+    PER ASSET (each asset has its own beta in g). Q-values use common random numbers
+    shared across actions (sample-average approximation), so value iteration is a
+    deterministic contraction. Extractors are probed for V* and pi*; probed policies are
+    scored by Monte Carlo Bellman regret (64 shared noise samples per state; pi* labels
+    agree ~94-97% across Monte Carlo seeds, which caps attainable pi* accuracy).
+
+EXPERIMENT G (Table 7, dynamics shift): g_shift = g + bounded tanh repulsion from the original
+    (l, m) mean. A-trained extractors + probes are transferred to the shifted panel, whose
+    features are normalized with A's training statistics (so the shift is not hidden by
+    re-standardization), and compared with probes refit on B (Random Linear, Untrained:
+    same frozen extractor) and a JEPA retrained on B.
 
 How to run in Google Colab (any ONE of these):
-    1. File -> Upload notebook -> select this .py file (Colab auto-splits it into
-       cells on the '# %%' markers) -> Runtime -> Run all.
-    2. Upload the file to the Colab VM (folder icon, left pane) and run:
-           !python study3_ablations.py
+    1. Upload the file to the Colab VM and run:  !python study3_ablations.py --seed 42
+    2. File -> Upload notebook -> this .py file (cells split on '# %%') -> Run all.
+       Flags cannot be passed this way; edit the defaults in _parse_args instead.
     3. Once pushed to GitHub: colab.research.google.com -> GitHub tab -> this file.
 
-EXPERIMENT D (portfolio allocation): does the recovered state machine improve ALLOCATION?
-    The three extractors' Ridge probes predict the existing Study-3 targets (s_hor and
-    y_rv); the recovered drift state gives the expected H-day return and the predicted
-    RV gives the H-day variance. Long-only mean-variance weights (capped, rebalanced
-    every H days out-of-sample) are scored on TRUE expected returns/variances computed
-    exactly from the DGP, against equal-weight, inverse-vol, and oracle baselines.
+Flags:
+    --seed S             encoder init / JEPA training / probe seed (default 42). Every table
+                         is single-seed; run 42, 43, 44 and aggregate for mean +- std.
+    --decision-dgp D     "centered" (default) or "original" (the v3 DGP) for Experiments C-G.
+    --quick              tiny smoke test (a few minutes on CPU; numbers are meaningless).
 
-EXPERIMENT E (LP decision-complexity scaling): how does decision quality scale with the
-    size of the weight vector? For n in {2, 4, 8, 16, 20} assets, solve the LP
-        max_w  w' mu_hat   s.t.  sum(w) = 1,  0 <= w <= 2/n
-    with mu_hat from each extractor's recovered drift, on seeded random asset subsets,
-    and score regret exactly against the LP solved on TRUE expected returns.
-
-EXPERIMENT F (RL emulation): the MDP induced by the known g (27-action grid, transition
-    kernel = g + the DGP's process noise, reward = conditional Sharpe of the next state,
-    discount 0.9) is solved by stochastic value iteration into an oracle V*, pi*. Can
-    each extractor's representation recover the optimal route: probe V* (regression) and
-    pi* (27-way one-hot readout), scored by exact Bellman regret of the probed policy.
-
-EXPERIMENT G (dynamics shift): the world changes to g_shift, which steers states AWAY
-    from the original central mass (saturating tanh repulsion from the original (l, m)
-    mean; bounded force keeps the shifted world stationary). Is optimal behavior saved?
-    A-trained extractors/probes are transferred to the shifted panel (state recovery +
-    Bellman regret under the shifted MDP's oracle) and compared against extractors/
-    probes retrained on the shifted panel.
-
-Runtime: the sweep trains JEPA Cluster once per (noise, horizon) pair (12 trainings) plus a
-5-member Action-JEPA ensemble for Experiment C (5 more) and one shift-world JEPA (G), so
-expect roughly 60-100 minutes on a Colab CPU, faster on GPU. Experiments D/E/F/G reuse the
-cached medium/H=5 features; F/G add two value iterations (~2-3 min each on CPU).
-`tabicl` is optional; the original RBF-ensemble fallback is used when it is not installed.
+Runtime: 12 JEPA trainings for Ablation B, 5 Action-JEPA trainings for C, one extra JEPA for
+the centered decision panel and one for the shifted world (G): roughly 60-100 minutes on a
+Colab CPU, much less on GPU. Value iteration is vectorized and takes seconds.
+`tabicl` is optional; without it the "TabICL" probe is an RBF random-features + Ridge
+fallback, and the tables label those rows "rbf-fb" so they are never reported as TabICL.
 """
-
+%pip install tabicl
 # %%
 # ============================================================================
 # SETUP & IMPORTS (verbatim from study3_state_timescale_experiments.py)
@@ -108,8 +119,10 @@ except ImportError:
 # ============================================================================
 # EXISTING STUDY-3 UTILITIES - VERBATIM COPY (keep in sync with
 # scripts/study3_state_timescale_experiments.py). Nothing here is changed except
-# the optional state_noise kwarg on generate_panel_with_interventions, whose
-# default reproduces the original stream bit-for-bit.
+# optional kwargs whose defaults reproduce the original behavior bit-for-bit:
+# state_noise / transition_fn on generate_panel_with_interventions, and
+# transition_fn / norm_stats on build_horizon_dataset (which also returns its
+# normalization stats under "norm_stats").
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -242,11 +255,16 @@ def build_horizon_dataset(
     context_len: int = 40,
     horizon: int = 5,
     train_end_day: int = 1000,
+    transition_fn=None,
+    norm_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Constructs context windows X_{t-L+1:t}, future target windows X_{t+1:t+H},
     actions applied on decision day t, future state s_{t+H},
     and log H-day realized volatility target y_{t+H}, with an H-day embargo split.
+    transition_fn: the g that generated the panel (for the s_det1 target); default = transition_function.
+    norm_stats: (mean, std) to normalize features with; default = this panel's training slice.
+    Both defaults reproduce the original behavior exactly.
     """
     feats = panel["features"]
     acts = panel["actions"]
@@ -258,9 +276,13 @@ def build_horizon_dataset(
     start_t = 60 + context_len
     max_t = T - horizon - 1
 
-    train_slice = feats[:, start_t:train_end_day, :].reshape(-1, F_dim)
-    f_mean = train_slice.mean(axis=0, keepdims=True)
-    f_std = train_slice.std(axis=0, keepdims=True) + 1e-8
+    if norm_stats is None:
+        train_slice = feats[:, start_t:train_end_day, :].reshape(-1, F_dim)
+        f_mean = train_slice.mean(axis=0, keepdims=True)
+        f_std = train_slice.std(axis=0, keepdims=True) + 1e-8
+    else:
+        f_mean, f_std = norm_stats
+    g = transition_fn if transition_fn is not None else transition_function
     feats_norm = np.clip((feats - f_mean) / f_std, -8.0, 8.0)
 
     splits = {"train": [], "test": []}
@@ -278,7 +300,7 @@ def build_horizon_dataset(
 
             act_t = acts[i, t]
             s_t = states[i, t]
-            s_next_det = transition_function(s_t, act_t, betas[i])
+            s_next_det = g(s_t, act_t, betas[i])
             s_horizon = states[i, t + horizon]
 
             r2_fut = rets[i, t + 1:t + 1 + horizon] ** 2
@@ -298,6 +320,7 @@ def build_horizon_dataset(
         out[f"y_rv_{sp}"] = np.array([r[6] for r in rows], dtype=np.float32)
         out[f"asset_{sp}"] = np.array([r[7] for r in rows], dtype=np.int64)
         out[f"date_{sp}"] = np.array([r[8] for r in rows], dtype=np.int64)
+    out["norm_stats"] = (f_mean, f_std)
     return out
 
 
@@ -593,18 +616,39 @@ def within_asset_r2(y_true: np.ndarray, y_pred: np.ndarray, asset_ids: np.ndarra
 
 # %%
 # ============================================================================
-# NEW ABLATION CODE (this part is new; everything above is the existing Study-3
-# machinery copied verbatim so this single file runs standalone in Colab).
+# NEW CODE (everything above is the existing Study-3 machinery copied verbatim
+# so this single file runs standalone in Colab).
 # ============================================================================
 
-# Protocol constants (identical to the original Study-3 experiments)
+import argparse
+import os
+from typing import Callable
+
+
+def _parse_args():
+    p = argparse.ArgumentParser(description="Study 3 ablations and decision experiments")
+    p.add_argument("--seed", type=int, default=42,
+                   help="encoder init / JEPA training / probe seed; run 42, 43, 44 for 3-seed tables")
+    p.add_argument("--decision-dgp", choices=["centered", "original"], default="centered",
+                   help="DGP for Experiments C-G ('original' = the v3 DGP)")
+    p.add_argument("--quick", action="store_true", help="tiny smoke test; numbers are meaningless")
+    args, _ = p.parse_known_args()  # tolerate Jupyter/Colab kernel arguments
+    return args
+
+
+ARGS = _parse_args()
+
+# Protocol constants (identical to the original Study-3 experiments unless --quick)
 PANEL_SEED = 2026          # same panel seed as the original main script
-PROBE_SEED = 42            # same seed as Experiment 2 (untrained encoder, JEPA, probes)
+PROBE_SEED = ARGS.seed     # 42 = Experiment 2 seed (untrained encoder, JEPA, probes)
 CONTEXT_LEN = 40
-TRAIN_END_DAY = 1000
-N_ASSETS, N_DAYS = 20, 1400
-JEPA_EPOCHS = 10
+N_ASSETS = 20
+N_DAYS, TRAIN_END_DAY = (500, 350) if ARGS.quick else (1400, 1000)
+JEPA_EPOCHS = 1 if ARGS.quick else 10
+N_ENSEMBLE = 2 if ARGS.quick else 5
+VI_ITERS = 5 if ARGS.quick else 30
 RANDOM_PROJ_OUT_DIM = 33   # matches TimeSeriesEncoder(mag_preserving=True).out_dim
+PROBE_LABEL = "tabicl" if HAS_TABICL else "rbf-fb"   # the RBF fallback is NOT TabICL
 
 # Process-noise levels on the latent state transition (l, m, p); medium = original
 NOISE_LEVELS: Dict[str, Tuple[float, float, float]] = {
@@ -614,14 +658,95 @@ NOISE_LEVELS: Dict[str, Tuple[float, float, float]] = {
 }
 ABLATION_HORIZONS = [1, 5, 10, 22]
 
-# Shared decision machinery (Experiments C-F): 27-point action grid and the DGP process noise
+# Shared decision machinery (Experiments C-G): 27-point action grid and the DGP process noise
 ACTION_GRID = np.array(list(itertools.product([-1.0, 0.0, 1.0], repeat=3)), dtype=np.float32)
-PROCESS_NOISE = np.array(NOISE_LEVELS["medium"], dtype=np.float32)
-# Registries filled as experiments run: trained extractor models (for cross-panel transfer)
-# and solved MDPs (value functions), keyed so later experiments reuse earlier results.
+ZERO_ACTION = int(np.argmin(np.linalg.norm(ACTION_GRID, axis=1)))
+PROCESS_NOISE = np.array(NOISE_LEVELS["medium"], dtype=np.float64)
+# Registries filled as experiments run: trained extractors (for cross-panel transfer) and solved MDPs.
 EXTRACTOR_MODELS: Dict[Tuple[str, int], dict] = {}
-_MDP_CACHE: Dict[str, tuple] = {}
+_MDP_CACHE: Dict[str, dict] = {}
 
+
+def _ens_seed(base: int, member: int) -> int:
+    """Ensemble-member seed; equals the v3 seeds (base + member) at the default --seed 42."""
+    return base + member + 1000 * (PROBE_SEED - 42)
+
+
+# ----------------------------------------------------------------------------
+# DECISION DGP: vectorized g and the "world" used by Experiments C-G
+# ----------------------------------------------------------------------------
+
+def transition_function_vec(S, A, beta, centered_drift: bool = False) -> np.ndarray:
+    """
+    Vectorized g(s, a) over any leading dims (S, A: (..., 3); beta broadcastable).
+    centered_drift=False is the original transition_function. centered_drift=True changes
+    ONLY the drift equation's vol coupling, tanh(a_regime + 0.3 l) -> tanh(a_regime + 0.3 (l - beta)),
+    so the drift no longer sits permanently below zero.
+    """
+    S = np.asarray(S, dtype=np.float64)
+    A = np.asarray(A, dtype=np.float64)
+    l, m, p = S[..., 0], S[..., 1], S[..., 2]
+    a_shock, a_regime, a_damp = A[..., 0], A[..., 1], A[..., 2]
+
+    eff_persistence = 0.88 + 0.10 * np.tanh(p - 1.2 * a_damp)
+    nonlinear_kick = (
+        0.45 * a_shock * (1.0 + 0.5 * np.tanh(l))
+        + 0.30 * np.sin(1.5 * a_regime + 0.5 * m)
+        - 0.25 * a_damp * l
+    )
+    l_next = (1.0 - eff_persistence) * beta + eff_persistence * l + nonlinear_kick
+    coupling = 0.3 * ((l - beta) if centered_drift else l)
+    m_next = 0.85 * m + 0.60 * np.tanh(a_regime + coupling) - 0.20 * a_shock
+    p_next = 0.90 * p - 0.50 * a_damp + 0.15 * np.abs(a_shock)
+    return np.stack([l_next, m_next, p_next], axis=-1)
+
+
+@dataclass
+class World:
+    name: str
+    g: Callable       # scalar g(s, a, beta) -> float32 (3,), used to simulate panels
+    g_vec: Callable   # vectorized g(S, A, beta), used by oracles and value iteration
+
+
+def make_world(dgp: str) -> World:
+    if dgp == "original":
+        return World("original", transition_function,
+                     lambda S, A, b: transition_function_vec(S, A, b, centered_drift=False))
+
+    def g_centered(s, a, b):
+        return transition_function_vec(s, a, b, centered_drift=True).astype(np.float32)
+
+    return World("centered", g_centered,
+                 lambda S, A, b: transition_function_vec(S, A, b, centered_drift=True))
+
+
+def _world_key(world: World) -> str:
+    """Feature-cache key for the medium-noise decision panel (shared with Ablation A if original)."""
+    return "medium" if world.name == "original" else f"medium-{world.name}"
+
+
+def state_utility(s_next: np.ndarray) -> np.ndarray:
+    """Conditional Sharpe: expected next-day return per unit next-day vol.
+    Matches the panel construction: E[r_{t+1}] = 0.0005 * m', vol = exp(l')/sqrt(252)."""
+    l, m = s_next[..., 0], s_next[..., 1]
+    vol = np.exp(np.clip(l, -4.5, 1.0)) / np.sqrt(252.0)
+    return 0.0005 * m / (vol + 1e-12)
+
+
+def print_dgp_diagnostics(name: str, panel: Dict[str, np.ndarray]):
+    """The two properties that made the original DGP's decision experiments misleading."""
+    s = panel["states"][:, 100:].reshape(-1, 3)
+    l, m = s[:, 0], s[:, 1]
+    vol = np.exp(np.clip(l, -4.5, 1.0)) / np.sqrt(252.0)
+    print(f"  {name:<22} mean l {l.mean():6.2f} | mean m {m.mean():6.2f} | "
+          f"m < 0: {100 * np.mean(m < 0):5.1f}% | vol clipped: {100 * np.mean(l < -4.5):4.1f}% below / "
+          f"{100 * np.mean(l > 1.0):4.1f}% above | "
+          f"median |drift|/vol {np.median(np.abs(0.0005 * m) / vol):.3f}")
+
+
+# ----------------------------------------------------------------------------
+# EXTRACTORS
+# ----------------------------------------------------------------------------
 
 class RandomLinearProjector(nn.Module):
     """
@@ -645,7 +770,7 @@ class RandomLinearProjector(nn.Module):
 
 
 class IdentityPredictor(nn.Module):
-    """No-op predictor so extract_representations returns the raw projector output."""
+    """No-op predictor so extract_representations returns the raw encoder/projector output."""
 
     def forward(self, z: torch.Tensor, a=None) -> torch.Tensor:
         return z
@@ -653,7 +778,7 @@ class IdentityPredictor(nn.Module):
 
 def build_extractor_features(
     data: Dict[str, np.ndarray],
-    noise_name: str,
+    panel_key: str,
     horizon: int,
     device: str = "cpu",
     cache: Dict[Tuple[str, int], Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
@@ -661,22 +786,21 @@ def build_extractor_features(
     """
     Train/test representations {extractor: (Z_train, Z_test)} for the three extractors,
     using the exact protocols of the original experiments:
-      - Random Linear: frozen projector (fixed seed)
-      - Untrained Conv+Transformer: set_seed(42) then untrained encoder + predictor (Exp. 2, variant A)
-      - JEPA Cluster: train_jepa_model(cluster sampler, epochs=10, seed=42) (Exp. 2, variant D)
-    Cached per (noise, horizon) so the medium/H=5 cell is shared by Tables A and B.
+      - Random Linear: frozen projector (seed = PROBE_SEED)
+      - Untrained Conv+Transformer: set_seed(PROBE_SEED), untrained encoder + predictor (Exp. 2, variant A)
+      - JEPA Cluster: train_jepa_model(cluster sampler, epochs=JEPA_EPOCHS, seed=PROBE_SEED) (Exp. 2, variant D)
+    Cached per (panel_key, horizon) so e.g. the medium/H=5 cell is shared by Tables 1 and 2.
     """
-    if cache is not None and (noise_name, horizon) in cache:
-        return cache[(noise_name, horizon)]
+    if cache is not None and (panel_key, horizon) in cache:
+        return cache[(panel_key, horizon)]
 
     X_ctx_tr, X_fut_tr, act_tr = data["X_ctx_train"], data["X_fut_train"], data["act_train"]
     X_ctx_te = data["X_ctx_test"]
     T, F_dim = X_ctx_tr.shape[1], X_ctx_tr.shape[2]
-
-    proj = RandomLinearProjector(
-        context_len=T, n_features=F_dim, out_dim=RANDOM_PROJ_OUT_DIM, seed=PROBE_SEED
-    ).to(device)
     id_pred = IdentityPredictor()
+
+    proj = RandomLinearProjector(context_len=T, n_features=F_dim, out_dim=RANDOM_PROJ_OUT_DIM,
+                                 seed=PROBE_SEED).to(device)
     Z_rand_tr = extract_representations(proj, id_pred, X_ctx_tr, device=device)
     Z_rand_te = extract_representations(proj, id_pred, X_ctx_te, device=device)
 
@@ -699,37 +823,38 @@ def build_extractor_features(
         "Untrained Conv+Transformer": (Z_untr_tr, Z_untr_te),
         "JEPA Cluster": (Z_jepa_tr, Z_jepa_te),
     }
-    EXTRACTOR_MODELS[(noise_name, horizon)] = {
-        "proj": proj, "id_pred": id_pred,
-        "untrained": (untrained_enc, untrained_pred),
-        "jepa": (jepa_enc, jepa_pred),
+    EXTRACTOR_MODELS[(panel_key, horizon)] = {
+        "Random Linear": (proj, id_pred),
+        "Untrained Conv+Transformer": (untrained_enc, untrained_pred),
+        "JEPA Cluster": (jepa_enc, jepa_pred),
     }
     if cache is not None:
-        cache[(noise_name, horizon)] = feats
+        cache[(panel_key, horizon)] = feats
     return feats
+
+
+def _probe_inputs(Z_tr, Z_te, data):
+    """Probes see [Z, a_t] (same protocol as the paper)."""
+    return np.hstack([Z_tr, data["act_train"]]), np.hstack([Z_te, data["act_test"]])
 
 
 # %%
 # ============================================================================
 # TABLE 1 | ABLATION A: RANDOM LINEAR vs UNTRAINED CONV+TRANSFORMER vs JEPA
-# (fixed medium-noise, H=5 setting; Ridge and TabICL probes; same metrics/protocol
-#  as the paper: probes see [Z, a_t], effective rank on Z_test alone)
+# (original DGP, medium noise, H=5; Ridge and TabICL probes; effective rank on Z_test alone)
 # ============================================================================
 
-def run_ablation_a_random_baseline(
-    panel: Dict[str, np.ndarray],
-    device: str = "cpu",
-    cache: Dict[Tuple[str, int], Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
-):
+def run_ablation_a_random_baseline(panel, device: str = "cpu", cache: dict = None):
     print("=" * 108)
     print("TABLE 1 | ABLATION A: RANDOM LINEAR vs UNTRAINED CONV+TRANSFORMER vs JEPA CLUSTER")
-    print("         (medium process noise, H = 5, Ridge and TabICL probes)")
+    print(f"         (original DGP, medium process noise, H = 5, Ridge and {PROBE_LABEL} probes)")
+    if not HAS_TABICL:
+        print("         NOTE: tabicl is not installed -> 'rbf-fb' rows are the RBF random-features + Ridge")
+        print("         fallback, NOT TabICL. Install tabicl and re-run before reporting TabICL numbers.")
     print("=" * 108)
 
     data = build_horizon_dataset(panel, context_len=CONTEXT_LEN, horizon=5, train_end_day=TRAIN_END_DAY)
     feats = build_extractor_features(data, "medium", 5, device=device, cache=cache)
-
-    act_tr, act_te = data["act_train"], data["act_test"]
     y_rv_tr, y_rv_te = data["y_rv_train"], data["y_rv_test"]
     s_hor_tr, s_hor_te = data["s_hor_train"], data["s_hor_test"]
     asset_te = data["asset_test"]
@@ -743,13 +868,13 @@ def run_ablation_a_random_baseline(
     print("-" * len(header))
     for name, (Z_tr, Z_te) in feats.items():
         erank = compute_effective_rank(Z_te)
-        F_tr = np.hstack([Z_tr, act_tr])
-        F_te = np.hstack([Z_te, act_te])
+        F_tr, F_te = _probe_inputs(Z_tr, Z_te, data)
         for probe in ["ridge", "tabicl"]:
             y_hat = fit_predict_probe(F_tr, y_rv_tr, F_te, probe_type=probe, support_stride=stride, seed=PROBE_SEED)
             s_hat = fit_predict_probe(F_tr, s_hor_tr, F_te, probe_type=probe, support_stride=stride, seed=PROBE_SEED)
+            label = "ridge" if probe == "ridge" else PROBE_LABEL
             print(
-                f"{name:<30} | {probe:<7} | {erank:>9.2f} | "
+                f"{name:<30} | {label:<7} | {erank:>9.2f} | "
                 f"{r2_score(y_rv_te, y_hat):>12.4f} | {within_asset_r2(y_rv_te, y_hat, asset_te):>12.4f} | "
                 f"{within_asset_r2(s_hor_te, s_hat, asset_te):>15.4f}"
             )
@@ -759,8 +884,7 @@ def run_ablation_a_random_baseline(
 # %%
 # ============================================================================
 # TABLE 2 | ABLATION B: 1st/2nd/3rd-ORDER LATENT STATE RECOVERY
-# (horizons {1,5,10,22} x noise {low,medium,high}; fixed-capacity Ridge probe;
-#  within-asset R^2 per order + effective rank)
+# (original DGP; horizons {1,5,10,22} x noise {low,medium,high}; fixed-capacity Ridge probe)
 # ============================================================================
 
 def higher_order_terms(s: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -774,14 +898,10 @@ def higher_order_terms(s: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return order2, order3
 
 
-def run_ablation_b_order_recovery(
-    panels: Dict[str, Dict[str, np.ndarray]],
-    device: str = "cpu",
-    cache: Dict[Tuple[str, int], Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
-):
+def run_ablation_b_order_recovery(panels, device: str = "cpu", cache: dict = None):
     print("\n" + "=" * 108)
     print("TABLE 2 | ABLATION B: 1st / 2nd / 3rd-ORDER LATENT STATE RECOVERY, RIDGE PROBE")
-    print("         (horizons H in {1, 5, 10, 22} x process noise {low, medium, high})")
+    print("         (original DGP; horizons H in {1, 5, 10, 22} x process noise {low, medium, high})")
     print("=" * 108)
 
     for noise_name in ["low", "medium", "high"]:
@@ -794,10 +914,9 @@ def run_ablation_b_order_recovery(
         print("-" * len(header))
 
         for H in ABLATION_HORIZONS:
-            data = build_horizon_dataset(panels[noise_name], context_len=CONTEXT_LEN, horizon=H, train_end_day=TRAIN_END_DAY)
+            data = build_horizon_dataset(panels[noise_name], context_len=CONTEXT_LEN, horizon=H,
+                                         train_end_day=TRAIN_END_DAY)
             feats = build_extractor_features(data, noise_name, H, device=device, cache=cache)
-
-            act_tr, act_te = data["act_train"], data["act_test"]
             s_hor_tr, s_hor_te = data["s_hor_train"], data["s_hor_test"]
             q_tr, c_tr = higher_order_terms(s_hor_tr)
             q_te, c_te = higher_order_terms(s_hor_te)
@@ -805,8 +924,7 @@ def run_ablation_b_order_recovery(
 
             for name, (Z_tr, Z_te) in feats.items():
                 erank = compute_effective_rank(Z_te)
-                F_tr = np.hstack([Z_tr, act_tr])
-                F_te = np.hstack([Z_te, act_te])
+                F_tr, F_te = _probe_inputs(Z_tr, Z_te, data)
                 r2_orders = []
                 for y_tr, y_te in [(s_hor_tr, s_hor_te), (q_tr, q_te), (c_tr, c_te)]:
                     y_hat = fit_predict_probe(F_tr, y_tr, F_te, probe_type="ridge", seed=PROBE_SEED)
@@ -821,24 +939,14 @@ def run_ablation_b_order_recovery(
 # %%
 # ============================================================================
 # EXPERIMENT C: BELIEF-BASED ACTION SELECTION (belief-space planning)
-# Does the learned state machine support DECISIONS, not just probes?
-# For each test context we enumerate a 27-point action grid; a 5-member ensemble
-# of Action-JEPA predictors (vs. 5 untrained encoders) forms a belief over the next
-# state: ensemble mean = expected dynamics, ensemble spread = estimated risk
-# (epistemic only; process noise is unknowable to the model). A safety-first policy
-# first removes actions whose estimated P(dangerous log-vol state) exceeds a
-# tolerance, then maximizes the conditional Sharpe E[r']/vol' among the survivors.
-# Because the DGP is known, every policy is scored against the oracle built from
-# the true transition function: true regret, % optimal actions, % dangerous states.
+# Ensemble mean = expected dynamics, ensemble spread = epistemic risk on log-vol (process
+# noise is unknowable to the model). Safety-first removes actions with estimated
+# P(dangerous) > tol, then maximizes the conditional Sharpe among survivors.
+# The "Action-JEPA enc. + lin-a" rows use the SAME trained Action-JEPA encoders as the
+# "Action-JEPA Ens." rows, but read out [z, a] linearly (like the untrained rows): if they
+# match the untrained rows, the decision gap comes from the predictor's nonlinear action
+# pathway, not from the learned representation.
 # ============================================================================
-
-def state_utility(s_next: np.ndarray) -> np.ndarray:
-    """Conditional Sharpe: expected next-day log-return per unit next-day vol.
-    Matches the panel construction: E[r_{t+1}] = 0.0005 * m', vol = exp(l')/sqrt(252)."""
-    l, m = s_next[..., 0], s_next[..., 1]
-    vol = np.exp(np.clip(l, -4.5, 1.0)) / np.sqrt(252.0)
-    return 0.0005 * m / (vol + 1e-12)
-
 
 def _fit_ridge_probe(Z_tr: np.ndarray, y_tr: np.ndarray, seed: int = 42):
     scaler = StandardScaler()
@@ -847,45 +955,46 @@ def _fit_ridge_probe(Z_tr: np.ndarray, y_tr: np.ndarray, seed: int = 42):
     return scaler, model
 
 
-def run_experiment_c_belief_planning(
-    panel: Dict[str, np.ndarray],
-    device: str = "cpu",
-    n_ensemble: int = 5,
-    n_eval: int = 1500,
-    risk_tolerance: float = 0.20,
-):
+def _linear_in_action_belief(enc, pred, X_ctx_tr, act_tr, y_tr, X_eval, A_rep, K, seed, device):
+    """Ridge on [z, a] from (enc, pred) features; returns predicted next states (K, n, 3)."""
+    Z_tr = extract_representations(enc, pred, X_ctx_tr, device=device)
+    scaler, ridge = _fit_ridge_probe(np.hstack([Z_tr, act_tr]), y_tr, seed=seed)
+    Z_eval = extract_representations(enc, pred, X_eval, device=device)
+    F_rep = np.hstack([np.tile(Z_eval, (K, 1)), A_rep])
+    return ridge.predict(scaler.transform(F_rep)).reshape(K, len(X_eval), 3)
+
+
+def run_experiment_c_belief_planning(panel, world: World, device: str = "cpu",
+                                     n_ensemble: int = N_ENSEMBLE, n_eval: int = 1500,
+                                     risk_tolerance: float = 0.20):
     print("\n" + "=" * 108)
     print("TABLE 3 | EXPERIMENT C: BELIEF-BASED ACTION SELECTION — CAN THE LEARNED STATE MACHINE")
-    print(f"         PICK BETTER ACTIONS? (H = 1, medium noise, 27-action grid, {n_ensemble}-member")
-    print(f"         ensembles, safety filter at P(dangerous) <= {risk_tolerance})")
+    print(f"         PICK BETTER ACTIONS? ({world.name} DGP, H = 1, medium noise, 27-action grid,")
+    print(f"         {n_ensemble}-member ensembles, safety filter at P(dangerous) <= {risk_tolerance}; seed {PROBE_SEED})")
     print("=" * 108)
 
-    data = build_horizon_dataset(panel, context_len=CONTEXT_LEN, horizon=1, train_end_day=TRAIN_END_DAY)
+    data = build_horizon_dataset(panel, context_len=CONTEXT_LEN, horizon=1,
+                                 train_end_day=TRAIN_END_DAY, transition_fn=world.g)
     X_ctx_tr, X_fut_tr, act_tr = data["X_ctx_train"], data["X_fut_train"], data["act_train"]
     s_det1_tr = data["s_det1_train"]
     X_ctx_te = data["X_ctx_test"]
     s_curr_te, asset_te = data["s_curr_test"], data["asset_test"]
     betas = panel["asset_betas"]
 
-    tau = float(np.quantile(panel["states"][:, :, 0], 0.90))  # dangerous log-vol level
+    # Dangerous log-vol level: 90th percentile of TRAINING-period states (no test information)
+    tau = float(np.quantile(panel["states"][:, :TRAIN_END_DAY, 0], 0.90))
 
     rng = np.random.default_rng(7)
     idx = rng.choice(len(X_ctx_te), size=min(n_eval, len(X_ctx_te)), replace=False)
     X_eval, s_curr, beta_eval = X_ctx_te[idx], s_curr_te[idx], betas[asset_te[idx]]
-
-    grid = np.array(list(itertools.product([-1.0, 0.0, 1.0], repeat=3)), dtype=np.float32)
-    K, n = len(grid), len(X_eval)
-    zero_idx = int(np.argmin(np.linalg.norm(grid, axis=1)))  # the (0, 0, 0) action
+    K, n = len(ACTION_GRID), len(X_eval)
+    cols = np.arange(n)
 
     # Oracle: true next state per (action, context) via the known transition function
-    s_next_true = np.zeros((K, n, 3), dtype=np.float32)
-    for k in range(K):
-        for i in range(n):
-            s_next_true[k, i] = transition_function(s_curr[i], grid[k], beta_eval[i])
+    s_next_true = world.g_vec(s_curr[None, :, :], ACTION_GRID[:, None, :], beta_eval[None, :])  # (K, n, 3)
     U_true = state_utility(s_next_true)
     danger_true = s_next_true[:, :, 0] > tau
     a_star = np.argmax(U_true, axis=0)
-    cols = np.arange(n)
 
     def policy_stats(a_hat: np.ndarray) -> Tuple[float, float, float, float]:
         u = U_true[a_hat, cols]
@@ -896,82 +1005,80 @@ def run_experiment_c_belief_planning(
             float(100.0 * np.mean(danger_true[a_hat, cols])),
         )
 
-    # --- Action-JEPA ensemble: belief over the next state from P(z_t, a_t) + Ridge readout
     X_rep = np.tile(X_eval, (K, 1, 1))
-    A_rep = np.repeat(grid, n, axis=0)
-    jepa_states = []
+    A_rep = np.repeat(ACTION_GRID, n, axis=0)
+    jepa_states, jepa_lin_states, untr_states = [], [], []
     for m_idx in range(n_ensemble):
+        # Action-JEPA member: belief from P(z_t, a_t) + Ridge readout
+        seed_m = _ens_seed(0, m_idx)
         enc_m, pred_m = train_jepa_model(
             X_ctx_tr, X_fut_tr, act_tr, use_action_predictor=True,
             use_cluster_sampler=True, mag_preserving=True,
-            epochs=JEPA_EPOCHS, seed=m_idx, device=device,
+            epochs=JEPA_EPOCHS, seed=seed_m, device=device,
         )
         Z_tr_m = extract_representations(enc_m, pred_m, X_ctx_tr, act_tr, use_action=True, device=device)
-        scaler_m, ridge_m = _fit_ridge_probe(Z_tr_m, s_det1_tr, seed=m_idx)
+        scaler_m, ridge_m = _fit_ridge_probe(Z_tr_m, s_det1_tr, seed=seed_m)
         Z_rep = extract_representations(enc_m, pred_m, X_rep, A_rep, use_action=True, device=device)
         jepa_states.append(ridge_m.predict(scaler_m.transform(Z_rep)).reshape(K, n, 3))
-    jepa_states = np.stack(jepa_states)
+        # Control: same trained encoder, linear-in-action readout
+        jepa_lin_states.append(_linear_in_action_belief(
+            enc_m, IdentityPredictor(), X_ctx_tr, act_tr, s_det1_tr, X_eval, A_rep, K, seed_m, device))
 
-    # --- Untrained-encoder ensemble: same protocol on random features ([z_t, a_t])
-    untr_states = []
-    for m_idx in range(n_ensemble):
-        set_seed(100 + m_idx)
-        enc_m = TimeSeriesEncoder(mag_preserving=True).to(device)
-        pred_m = LatentPredictor(embed_dim=enc_m.out_dim, action_dim=0).to(device)
-        Z_tr_m = extract_representations(enc_m, pred_m, X_ctx_tr, device=device)
-        scaler_m, ridge_m = _fit_ridge_probe(np.hstack([Z_tr_m, act_tr]), s_det1_tr, seed=m_idx)
-        Z_eval_m = extract_representations(enc_m, pred_m, X_eval, device=device)
-        F_rep = np.hstack([np.tile(Z_eval_m, (K, 1)), A_rep])
-        untr_states.append(ridge_m.predict(scaler_m.transform(F_rep)).reshape(K, n, 3))
-    untr_states = np.stack(untr_states)
+        # Untrained member: random encoder + predictor, linear-in-action readout
+        seed_u = _ens_seed(100, m_idx)
+        set_seed(seed_u)
+        enc_u = TimeSeriesEncoder(mag_preserving=True).to(device)
+        pred_u = LatentPredictor(embed_dim=enc_u.out_dim, action_dim=0).to(device)
+        untr_states.append(_linear_in_action_belief(
+            enc_u, pred_u, X_ctx_tr, act_tr, s_det1_tr, X_eval, A_rep, K, _ens_seed(0, m_idx), device))
 
     def make_policies(states: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         mu = states.mean(axis=0)                    # (K, n, 3) expected dynamics
         sigma_l = states[:, :, :, 0].std(axis=0)    # (K, n) epistemic risk on log-vol
         p_danger = 0.5 * erfc((tau - mu[:, :, 0]) / (sigma_l * np.sqrt(2.0) + 1e-12))
         U_mu = state_utility(mu)
-
-        neutral = np.argmax(U_mu, axis=0)           # risk-neutral: max expected Sharpe
-        safe = p_danger <= risk_tolerance            # safety-first: remove dangerous actions
-        U_masked = np.where(safe, U_mu, -np.inf)
-        greedy = np.argmax(U_masked, axis=0)
+        neutral = np.argmax(U_mu, axis=0)
+        safe = p_danger <= risk_tolerance
+        greedy = np.argmax(np.where(safe, U_mu, -np.inf), axis=0)
         no_safe = ~safe.any(axis=0)
         greedy[no_safe] = np.argmin(p_danger[:, no_safe], axis=0)
         return neutral, greedy
 
     rows = [("Oracle (true g)",) + policy_stats(a_star)]
-    for name, states in [("Action-JEPA Ens.", jepa_states), ("Untrained Ens.", untr_states)]:
+    for name, states in [("Action-JEPA Ens.", np.stack(jepa_states)),
+                         ("Action-JEPA enc. + lin-a", np.stack(jepa_lin_states)),
+                         ("Untrained Ens.", np.stack(untr_states))]:
         neutral, greedy = make_policies(states)
         rows.append((f"{name} risk-neutral",) + policy_stats(neutral))
         rows.append((f"{name} safety-first",) + policy_stats(greedy))
     rng_pol = np.random.default_rng(11)
     rows.append(("Random action",) + policy_stats(rng_pol.integers(K, size=n)))
-    rows.append(("Zero action (do nothing)",) + policy_stats(np.full(n, zero_idx)))
+    rows.append(("Zero action (do nothing)",) + policy_stats(np.full(n, ZERO_ACTION)))
 
-    header = f"{'Policy':<30} | {'Mean True U':>11} | {'Mean Regret':>11} | {'% Optimal':>9} | {'% Dangerous':>11}"
-    print(f"Danger threshold tau = {tau:.3f} (90th pct of panel log-vol levels); utility = E[r']/vol' (conditional Sharpe)")
+    s_star = s_next_true[a_star, cols]
+    above_med_vol = s_star[:, 0] >= np.median(s_next_true[:, :, 0], axis=0)
+    print(f"Danger threshold tau = {tau:.3f} (90th pct of training-period log-vol); utility = E[r']/vol'")
+    print(f"Oracle diagnostics: chosen next drift m' < 0 in {100 * np.mean(s_star[:, 1] < 0):.1f}% of contexts "
+          f"(there, Sharpe rewards HIGHER vol); oracle picks above-median next log-vol in "
+          f"{100 * np.mean(above_med_vol):.1f}%")
+    header = f"{'Policy':<38} | {'Mean True U':>11} | {'Mean Regret':>11} | {'% Optimal':>9} | {'% Dangerous':>11}"
     print(header)
     print("-" * len(header))
     for name, u, regret, hit, dang in rows:
-        print(f"{name:<30} | {u:>11.5f} | {regret:>11.5f} | {hit:>9.1f} | {dang:>11.1f}")
+        print(f"{name:<38} | {u:>11.5f} | {regret:>11.5f} | {hit:>9.1f} | {dang:>11.1f}")
     print("-" * len(header))
 
 
 # %%
 # ============================================================================
-# EXPERIMENT D: PORTFOLIO ALLOCATION — does the recovered state machine improve
-# allocation? Predicted moments come from Ridge probes on the EXISTING Study-3
-# targets (s_hor -> expected H-day return via the drift state; y_rv -> H-day
-# variance). TRUE moments are computed exactly from the DGP states. Long-only
-# mean-variance weights, capped, rebalanced every H days on the test window.
-# Baselines: oracle MV (true states), inverse-vol (trailing 22d), equal-weight.
+# EXPERIMENT D: PORTFOLIO ALLOCATION. Every strategy solves the same exact QP;
+# the oracle plugs in true moments, so regret >= 0 by construction.
 # ============================================================================
 
 def _portfolio_inputs(panel, data, feats, H: int):
     """(unique_dates, {extractor: (mu_hat, var_hat)} per (date, asset), mu_true, var_true)."""
-    s_hor_tr, s_hor_te = data["s_hor_train"], data["s_hor_test"]
-    y_rv_tr, y_rv_te = data["y_rv_train"], data["y_rv_test"]
-    act_tr, act_te = data["act_train"], data["act_test"]
+    s_hor_tr = data["s_hor_train"]
+    y_rv_tr = data["y_rv_train"]
     asset_te, date_te = data["asset_test"], data["date_test"]
     unique_dates = np.unique(date_te)
     n_assets = panel["states"].shape[0]
@@ -983,33 +1090,41 @@ def _portfolio_inputs(panel, data, feats, H: int):
 
     moments = {}
     for name, (Z_tr, Z_te) in feats.items():
-        F_tr = np.hstack([Z_tr, act_tr])
-        F_te = np.hstack([Z_te, act_te])
+        F_tr, F_te = _probe_inputs(Z_tr, Z_te, data)
         s_hat = fit_predict_probe(F_tr, s_hor_tr, F_te, probe_type="ridge", seed=PROBE_SEED)
         rv_hat = fit_predict_probe(F_tr, y_rv_tr, F_te, probe_type="ridge", seed=PROBE_SEED)
-        mu = pivot(0.0005 * H * s_hat[:, 1])                                # E[H-day return] from recovered drift
-        var = pivot(H * (np.exp(rv_hat) / np.sqrt(252.0)) ** 2)             # H-day variance from predicted RV
+        mu = pivot(0.0005 * H * s_hat[:, 1])                        # E[H-day return] from recovered drift
+        var = pivot(H * (np.exp(rv_hat) / np.sqrt(252.0)) ** 2)     # H-day variance from predicted RV
         moments[name] = (mu, var)
 
+    # True H-day moments from the realized future DGP states (sum of daily means / variances)
     states = panel["states"]
     mu_true = np.zeros((len(unique_dates), n_assets))
     var_true = np.zeros((len(unique_dates), n_assets))
     for j, t in enumerate(unique_dates):
         fut = states[:, t + 1:t + 1 + H, :]
         mu_true[j] = 0.0005 * fut[:, :, 1].sum(axis=1)
-        var_true[j] = H * ((np.exp(np.clip(fut[:, :, 0], -4.5, 1.0)) / np.sqrt(252.0)) ** 2).sum(axis=1)
+        # v3 multiplied this sum by H as well (H^2 x the daily variance); fixed here
+        var_true[j] = ((np.exp(np.clip(fut[:, :, 0], -4.5, 1.0)) / np.sqrt(252.0)) ** 2).sum(axis=1)
     return unique_dates, moments, mu_true, var_true
 
 
-def _mv_weights(mu: np.ndarray, var: np.ndarray, cap: float = 0.25) -> np.ndarray:
-    """Long-only mean-variance tilt toward above-average assets: w ∝ max(mu - mean(mu), 0)/var,
-    capped, renormalized. Demeaning is required because every expected return in this DGP
-    is negative at H = 5; clipping absolute mu at zero would collapse all strategies (and
-    the oracle) to Equal-Weight."""
-    raw = np.clip(mu - mu.mean(), 0.0, None) / (var + 1e-12)
-    if raw.sum() <= 1e-12:
-        return np.full(len(mu), 1.0 / len(mu))
-    w = np.minimum(raw / raw.sum(), cap)
+def _qp_weights(mu: np.ndarray, var: np.ndarray, cap: float) -> np.ndarray:
+    """
+    Exact maximizer of w'mu - 0.5 w'diag(var) w  s.t.  sum(w) = 1, 0 <= w <= cap.
+    The QP is separable: w_i = clip((mu_i - nu) / var_i, 0, cap), with the multiplier nu
+    found by bisection so the weights sum to one (requires cap * n >= 1).
+    """
+    var = np.maximum(np.asarray(var, dtype=np.float64), 1e-12)
+    mu = np.asarray(mu, dtype=np.float64)
+    lo, hi = float(np.min(mu - cap * var)) - 1e-12, float(np.max(mu))   # sum(w(lo)) = n*cap >= 1, sum(w(hi)) = 0
+    for _ in range(200):
+        nu = 0.5 * (lo + hi)
+        if np.clip((mu - nu) / var, 0.0, cap).sum() > 1.0:
+            lo = nu
+        else:
+            hi = nu
+    w = np.clip((mu - lo) / var, 0.0, cap)
     return w / w.sum()
 
 
@@ -1019,20 +1134,22 @@ def _inverse_vol_weights(var: np.ndarray, cap: float = 0.25) -> np.ndarray:
     return w / w.sum()
 
 
-def run_experiment_d_portfolio(panel, device: str = "cpu", cache: dict = None, H: int = 5, weight_cap: float = 0.25):
+def run_experiment_d_portfolio(panel, world: World, device: str = "cpu", cache: dict = None,
+                               H: int = 5, weight_cap: float = 0.25):
     print("\n" + "=" * 112)
     print("TABLE 4 | EXPERIMENT D: PORTFOLIO ALLOCATION — DOES THE RECOVERED STATE MACHINE IMPROVE")
-    print(f"         ALLOCATION? (H = {H}, medium noise, long-only MV cap {weight_cap:.0%}, rebalanced every {H} days)")
+    print(f"         ALLOCATION? ({world.name} DGP, H = {H}, medium noise, long-only MV QP, cap {weight_cap:.0%},")
+    print(f"         rebalanced every {H} days; seed {PROBE_SEED})")
     print("=" * 112)
 
-    data = build_horizon_dataset(panel, context_len=CONTEXT_LEN, horizon=H, train_end_day=TRAIN_END_DAY)
-    feats = build_extractor_features(data, "medium", H, device=device, cache=cache)
+    data = build_horizon_dataset(panel, context_len=CONTEXT_LEN, horizon=H,
+                                 train_end_day=TRAIN_END_DAY, transition_fn=world.g)
+    feats = build_extractor_features(data, _world_key(world), H, device=device, cache=cache)
     unique_dates, moments, mu_true, var_true = _portfolio_inputs(panel, data, feats, H)
 
     rets = panel["returns"]
     n_assets = rets.shape[0]
     reb_idx = np.arange(0, len(unique_dates), H)
-
     var_hist = np.zeros((len(unique_dates), n_assets))
     for j, t in enumerate(unique_dates):
         var_hist[j] = H * rets[:, max(0, t - 21):t + 1].var(axis=1)
@@ -1042,65 +1159,51 @@ def run_experiment_d_portfolio(panel, device: str = "cpu", cache: dict = None, H
         for j in reb_idx:
             t = unique_dates[j]
             w = weight_fn(j)
-            mu_excess = mu_true[j] - mu_true[j].mean()
-            exp_u.append(float(w @ mu_excess - 0.5 * np.sum(w ** 2 * var_true[j])))
+            exp_u.append(float(w @ mu_true[j] - 0.5 * np.sum(w ** 2 * var_true[j])))
             realized.append(float(w @ rets[:, t + 1:t + 1 + H].sum(axis=1)))
         exp_u, realized = np.array(exp_u), np.array(realized)
         sharpe = float(realized.mean() / (realized.std() + 1e-12) * np.sqrt(252.0 / H))
         return float(exp_u.mean()), float(realized.sum()), sharpe
 
-    strategies = [("Oracle MV (true states)", lambda j: _mv_weights(mu_true[j], var_true[j], weight_cap))]
+    strategies = [("Oracle QP (true moments)", lambda j: _qp_weights(mu_true[j], var_true[j], weight_cap))]
     for name, (mu_hat, var_hat) in moments.items():
-        strategies.append((f"{name} MV", lambda j, mu=mu_hat, var=var_hat: _mv_weights(mu[j], var[j], weight_cap)))
+        strategies.append((f"{name} QP", lambda j, mu=mu_hat, var=var_hat: _qp_weights(mu[j], var[j], weight_cap)))
     strategies.append(("Inverse-Vol (trailing 22d)", lambda j: _inverse_vol_weights(var_hist[j], weight_cap)))
     strategies.append(("Equal-Weight (1/N)", lambda j: np.full(n_assets, 1.0 / n_assets)))
 
     results = [(name,) + run_strategy(fn) for name, fn in strategies]
-    ew_u = results[-1][1]
+    oracle_u = results[0][1]
 
-    header = (f"{'Portfolio':<30} | {'Mean MV Utility (true)':>22} | {'Δ vs Equal-Weight':>17} | "
+    print("Objective: true MV utility w'mu - 0.5 w'diag(Var) w with moments from the realized future DGP states.")
+    print("All QP strategies solve the same problem exactly; only the plugged-in moments differ.")
+    header = (f"{'Portfolio':<30} | {'Mean MV Utility (true)':>22} | {'Regret vs Oracle':>16} | "
               f"{'Realized Total':>14} | {'Realized Sharpe':>15}")
-    print("True moments computed exactly from the DGP states; predicted moments from Ridge probes on s_hor / y_rv.")
-    print("Objective is true mean-variance utility w'mu_excess - 0.5 w'Var w (diagonal true moments). The oracle")
-    print("(same rule on true moments) is a REFERENCE, not the exact optimum of the capped rule: extractor deltas")
-    print("vs it fall within the rule's ~±7e-5 optimality slack, so all extractors are statistically tied with it.")
-    print("All absolute expected returns are negative in this panel, so allocation is relative.")
     print(header)
     print("-" * len(header))
     for name, exp_u, tot_ret, sharpe in results:
-        print(f"{name:<30} | {exp_u:>22.6f} | {exp_u - ew_u:>17.6f} | {tot_ret:>14.4f} | {sharpe:>15.2f}")
-    print("-" * len(header))
-    for name, exp_u, tot_ret, sharpe in results:
-        print(f"{name:<30} | {exp_u:>16.6f} | {oracle_u - exp_u:>16.6f} | {tot_ret:>14.4f} | {sharpe:>15.2f}")
+        print(f"{name:<30} | {exp_u:>22.6f} | {oracle_u - exp_u:>16.6f} | {tot_ret:>14.4f} | {sharpe:>15.2f}")
     print("-" * len(header))
 
 
 # %%
 # ============================================================================
-# EXPERIMENT E: LP DECISION-COMPLEXITY SCALING — how does decision quality scale
-# with the weight-vector size n? For n in {2, 4, 8, 16, 20} assets solve
+# EXPERIMENT E: LP DECISION-COMPLEXITY SCALING
 #     max_w w'mu_hat  s.t.  sum(w)=1, 0 <= w <= 2/n
-# (box cap 2/n => exactly ceil(n/2) active positions; n=2 => pure argmax) with
-# mu_hat from each extractor's recovered drift, on seeded random asset subsets.
-# Regret is scored exactly against the LP solved on TRUE expected returns.
+# (box cap 2/n => ceil(n/2) active positions; n=2 => pure argmax). Regret vs the LP on true returns.
 # ============================================================================
 
-def run_experiment_e_lp_scaling(
-    panel,
-    device: str = "cpu",
-    cache: dict = None,
-    H: int = 5,
-    sizes: Tuple[int, ...] = (2, 4, 8, 16, 20),
-    n_subsets: int = 8,
-):
+def run_experiment_e_lp_scaling(panel, world: World, device: str = "cpu", cache: dict = None, H: int = 5,
+                                sizes: Tuple[int, ...] = (2, 4, 8, 16, 20), n_subsets: int = 8):
     print("\n" + "=" * 112)
     print("TABLE 5 | EXPERIMENT E: LP DECISION-COMPLEXITY SCALING — DOES DECISION REGRET GROW WITH")
-    print(f"         WEIGHT-VECTOR SIZE n? (max w'mu_hat s.t. sum(w)=1, 0<=w<=2/n; {n_subsets} seeded subsets per")
-    print("         size; regret vs. the LP solved on true expected returns)")
+    print(f"         WEIGHT-VECTOR SIZE n? ({world.name} DGP; max w'mu_hat s.t. sum(w)=1, 0<=w<=2/n; "
+          f"{n_subsets} seeded subsets per")
+    print(f"         size, 1 at n = {N_ASSETS} (the full panel); regret vs. the LP on true expected returns)")
     print("=" * 112)
 
-    data = build_horizon_dataset(panel, context_len=CONTEXT_LEN, horizon=H, train_end_day=TRAIN_END_DAY)
-    feats = build_extractor_features(data, "medium", H, device=device, cache=cache)
+    data = build_horizon_dataset(panel, context_len=CONTEXT_LEN, horizon=H,
+                                 train_end_day=TRAIN_END_DAY, transition_fn=world.g)
+    feats = build_extractor_features(data, _world_key(world), H, device=device, cache=cache)
     unique_dates, moments, mu_true, _ = _portfolio_inputs(panel, data, feats, H)
     n_assets = mu_true.shape[1]
     reb_idx = np.arange(0, len(unique_dates), H)
@@ -1108,9 +1211,7 @@ def run_experiment_e_lp_scaling(
     def solve_lp(mu_vec: np.ndarray, cap: float) -> np.ndarray:
         res = linprog(c=-mu_vec, A_eq=np.ones((1, len(mu_vec))), b_eq=[1.0],
                       bounds=[(0.0, cap)] * len(mu_vec), method="highs")
-        if res.success:
-            return res.x
-        return np.full(len(mu_vec), 1.0 / len(mu_vec))
+        return res.x if res.success else np.full(len(mu_vec), 1.0 / len(mu_vec))
 
     header = (f"{'n':>3} | {'Extractor':<30} | {'Mean Regret (true)':>18} | "
               f"{'Mean True E[R]':>14} | {'Top-1 Hit %':>10}")
@@ -1126,301 +1227,273 @@ def run_experiment_e_lp_scaling(
         star_arg = np.zeros((len(subsets), len(reb_idx)), dtype=np.int64)
         for si, sub in enumerate(subsets):
             for jj, j in enumerate(reb_idx):
-                w = solve_lp(mu_true[j, sub], cap)
-                u_star[si, jj] = float(w @ mu_true[j, sub])
+                u_star[si, jj] = float(solve_lp(mu_true[j, sub], cap) @ mu_true[j, sub])
                 star_arg[si, jj] = int(np.argmax(mu_true[j, sub]))
 
         for name, (mu_hat, _) in moments.items():
             regrets, utils, hits = [], [], []
             for si, sub in enumerate(subsets):
                 for jj, j in enumerate(reb_idx):
-                    w = solve_lp(mu_hat[j, sub], cap)
-                    u_hat = float(w @ mu_true[j, sub])
+                    u_hat = float(solve_lp(mu_hat[j, sub], cap) @ mu_true[j, sub])
                     regrets.append(u_star[si, jj] - u_hat)
                     utils.append(u_hat)
                     hits.append(100.0 * (int(np.argmax(mu_hat[j, sub])) == star_arg[si, jj]))
             print(f"{n:>3} | {name:<30} | {np.mean(regrets):>18.6f} | {np.mean(utils):>14.6f} | {np.mean(hits):>10.1f}")
 
-        eq_regret = [
-            u_star[si, jj] - float(mu_true[j, sub].mean())
-            for si, sub in enumerate(subsets) for jj, j in enumerate(reb_idx)
-        ]
-        print(f"{n:>3} | {'Equal-Weight (reference)':<30} | {np.mean(eq_regret):>18.6f} | "
-              f"{'—':>14} | {'—':>10}")
+        eq_regret = [u_star[si, jj] - float(mu_true[j, sub].mean())
+                     for si, sub in enumerate(subsets) for jj, j in enumerate(reb_idx)]
+        print(f"{n:>3} | {'Equal-Weight (reference)':<30} | {np.mean(eq_regret):>18.6f} | {'—':>14} | {'—':>10}")
         print("-" * len(header))
 
 
 # %%
 # ============================================================================
-# EXPERIMENT F: RL EMULATION — can the representation recover the OPTIMAL ROUTE
-# of the MDP induced by the known g? The state space is discretized; the MDP
-# (27-action grid, transition kernel = g + the DGP's process noise, reward =
-# conditional Sharpe of the next state, discount gamma) is solved by stochastic
-# value iteration -> oracle V*, pi*. Each extractor is probed for V* (Ridge
-# regression) and pi* (27-way one-hot readout); the probed policy is scored by
-# its exact Bellman regret on a fixed evaluation subsample.
+# EXPERIMENTS F/G MACHINERY: per-asset value iteration on a discretized state grid.
+# Q(s, a) = mean_k [ U(g(s, a, beta) + eps_k) + gamma V(nearest_cell(g(s, a, beta) + eps_k)) ]
+# with a FIXED set of noise draws eps_k, shared across actions (common random numbers), so value
+# iteration is a deterministic gamma-contraction of the sample-average MDP.
 # ============================================================================
 
-def _v_lookup(s: np.ndarray, axes, V: np.ndarray) -> float:
-    return float(V[tuple(int(np.argmin(np.abs(axes[k] - s[k]))) for k in range(3))])
+def _cell_index(S: np.ndarray, axes, n_grid) -> np.ndarray:
+    """Flat index of the nearest grid cell (clipped to the grid) for states S (..., 3)."""
+    idx = [
+        np.clip(np.rint((S[..., k] - axes[k][0]) / (axes[k][1] - axes[k][0])), 0, n_grid[k] - 1).astype(np.int64)
+        for k in range(3)
+    ]
+    return np.ravel_multi_index(idx, n_grid)
 
 
-def _bellman_q(s: np.ndarray, g, beta: float, axes, V: np.ndarray, gamma: float, rng) -> np.ndarray:
-    """Stochastic Q(s, a) over the 27 grid actions: 3-noise-sample Bellman backup."""
-    qs = np.zeros(len(ACTION_GRID))
-    for k, a in enumerate(ACTION_GRID):
-        acc = 0.0
-        for _ in range(3):
-            s_next = g(s, a, beta) + rng.normal(0.0, PROCESS_NOISE).astype(np.float32)
-            acc += float(state_utility(s_next[None, :])[0]) + gamma * _v_lookup(s_next, axes, V)
-        qs[k] = acc / 3.0
-    return qs
-
-
-def _solve_mdp(panel, transition_fn=None, gamma: float = 0.9, n_iter: int = 30,
-               n_grid: Tuple[int, int, int] = (11, 9, 9)) -> Tuple[list, np.ndarray, float]:
-    g = transition_fn if transition_fn is not None else transition_function
-    beta = float(panel["asset_betas"].mean())
-    flat = panel["states"].reshape(-1, 3)
-    lo = np.percentile(flat, 0.5, axis=0)
-    hi = np.percentile(flat, 99.5, axis=0)
+def _solve_mdp(panel, g_vec, gamma: float = 0.9, n_iter: int = VI_ITERS,
+               n_grid: Tuple[int, int, int] = (11, 9, 9), n_samples: int = 32) -> dict:
+    """One value function per asset (g depends on the asset's beta). Grid bounds from training states."""
+    flat = panel["states"][:, :TRAIN_END_DAY].reshape(-1, 3)
+    lo, hi = np.percentile(flat, 0.5, axis=0), np.percentile(flat, 99.5, axis=0)
     axes = [np.linspace(lo[k], hi[k], n_grid[k]) for k in range(3)]
+    cells = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+    K = len(ACTION_GRID)
     rng = np.random.default_rng(PROBE_SEED)
-    V = np.zeros(n_grid)
-    cells = list(itertools.product(range(n_grid[0]), range(n_grid[1]), range(n_grid[2])))
-    for _ in range(n_iter):
-        V_new = np.zeros(n_grid)
-        for cell in cells:
-            s = np.array([axes[k][cell[k]] for k in range(3)], dtype=np.float32)
-            V_new[cell] = float(np.max(_bellman_q(s, g, beta, axes, V, gamma, rng)))
-        V = V_new
-    return axes, V, beta
+    noise = rng.normal(0.0, PROCESS_NOISE, size=(n_samples, len(cells), 1, 3))   # shared across actions
+
+    V_all = []
+    for beta in panel["asset_betas"]:
+        S_next = g_vec(cells[None, :, None, :], ACTION_GRID[None, None, :, :], float(beta)) + noise
+        R = state_utility(S_next)                      # (n_samples, C, K)
+        nxt = _cell_index(S_next, axes, n_grid)
+        V = np.zeros(len(cells))
+        for _ in range(n_iter):
+            V = (R + gamma * V[nxt]).mean(axis=0).max(axis=1)
+        V_all.append(V)
+    return {"axes": axes, "n_grid": n_grid, "V": np.stack(V_all),
+            "betas": np.asarray(panel["asset_betas"], dtype=np.float64), "gamma": gamma}
 
 
-def _mdp_targets(s_arr: np.ndarray, mdp, transition_fn, gamma: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-row oracle V*(s) (nearest cell) and pi*(s) (exact one-step lookahead on V*)."""
-    axes, V, beta = mdp
-    g = transition_fn if transition_fn is not None else transition_function
-    rng = np.random.default_rng(PROBE_SEED + 1)
-    v = np.array([_v_lookup(s, axes, V) for s in s_arr])
-    pi = np.array([int(np.argmax(_bellman_q(s, g, beta, axes, V, gamma, rng))) for s in s_arr], dtype=np.int64)
-    return v, pi
+def _q_values(S: np.ndarray, assets: np.ndarray, mdp: dict, g_vec, n_samples: int, seed: int,
+              chunk: int = 2048) -> np.ndarray:
+    """Monte Carlo Q(s, a) for each row (its own asset's beta and V); returns (n_rows, 27).
+    The same noise draws are shared by all 27 actions of a row (common random numbers), so
+    action comparisons -- and therefore pi* labels -- are far less noisy than independent draws."""
+    rng = np.random.default_rng(seed)
+    K = len(ACTION_GRID)
+    out = np.empty((len(S), K))
+    for i in range(0, len(S), chunk):
+        s, a_ids = S[i:i + chunk], assets[i:i + chunk]
+        b = mdp["betas"][a_ids]
+        S_next = (g_vec(s[None, :, None, :], ACTION_GRID[None, None, :, :], b[None, :, None])
+                  + rng.normal(0.0, PROCESS_NOISE, size=(n_samples, len(s), 1, 3)))   # shared across actions
+        V_next = mdp["V"][a_ids[None, :, None], _cell_index(S_next, mdp["axes"], mdp["n_grid"])]
+        out[i:i + chunk] = (state_utility(S_next) + mdp["gamma"] * V_next).mean(axis=0)
+    return out
 
 
-def run_experiment_f_rl_emulation(panel, device: str = "cpu", cache: dict = None, H: int = 5,
-                                  gamma: float = 0.9, n_eval: int = 3000):
+def _policy_targets(data: Dict[str, np.ndarray], split: str, mdp: dict, g_vec, n_samples: int, seed: int):
+    """(V*, pi*, Q) per row of a split, from Q-values on the row's true current state."""
+    Q = _q_values(data[f"s_curr_{split}"], data[f"asset_{split}"], mdp, g_vec, n_samples, seed)
+    return Q.max(axis=1), Q.argmax(axis=1), Q
+
+
+def _bellman_regret(Q: np.ndarray, a_hat: np.ndarray) -> float:
+    return float(np.mean(Q.max(axis=1) - Q[np.arange(len(Q)), a_hat]))
+
+
+# %%
+# ============================================================================
+# EXPERIMENT F: RL EMULATION — can the representation recover the optimal route of the
+# MDP induced by g? Probe V* (Ridge) and pi* (27-way one-hot Ridge readout).
+# ============================================================================
+
+def run_experiment_f_rl_emulation(panel, world: World, device: str = "cpu", cache: dict = None,
+                                  H: int = 5, gamma: float = 0.9):
     print("\n" + "=" * 108)
     print("TABLE 6 | EXPERIMENT F: RL EMULATION — CAN THE REPRESENTATION RECOVER THE OPTIMAL ROUTE OF")
-    print(f"         THE MDP INDUCED BY g? (27-action grid, stochastic value iteration, gamma = {gamma}, reward =")
-    print("         conditional Sharpe of the next state; probed policies scored by exact Bellman regret)")
+    print(f"         THE MDP INDUCED BY g? ({world.name} DGP, 27-action grid, per-asset value iteration,")
+    print(f"         gamma = {gamma}, reward = conditional Sharpe of the next state; Monte Carlo Bellman regret)")
     print("=" * 108)
 
-    data = build_horizon_dataset(panel, context_len=CONTEXT_LEN, horizon=H, train_end_day=TRAIN_END_DAY)
-    feats = build_extractor_features(data, "medium", H, device=device, cache=cache)
+    data = build_horizon_dataset(panel, context_len=CONTEXT_LEN, horizon=H,
+                                 train_end_day=TRAIN_END_DAY, transition_fn=world.g)
+    feats = build_extractor_features(data, _world_key(world), H, device=device, cache=cache)
+    if world.name not in _MDP_CACHE:
+        _MDP_CACHE[world.name] = _solve_mdp(panel, world.g_vec, gamma=gamma)
+    mdp = _MDP_CACHE[world.name]
 
-    if "A" not in _MDP_CACHE:
-        _MDP_CACHE["A"] = _solve_mdp(panel, gamma=gamma)
-    mdp = _MDP_CACHE["A"]
-
-    V_tr, pi_tr = _mdp_targets(data["s_curr_train"], mdp, None, gamma)
-    V_te, pi_te = _mdp_targets(data["s_curr_test"], mdp, None, gamma)
+    V_tr, pi_tr, _ = _policy_targets(data, "train", mdp, world.g_vec, n_samples=64, seed=PROBE_SEED + 1)
+    V_te, pi_te, Q_te = _policy_targets(data, "test", mdp, world.g_vec, n_samples=64, seed=PROBE_SEED + 2)
     onehot = np.eye(len(ACTION_GRID), dtype=np.float32)
-    act_tr, act_te = data["act_train"], data["act_test"]
     asset_te = data["asset_test"]
 
-    rng_sub = np.random.default_rng(PROBE_SEED + 2)
-    sub = rng_sub.choice(len(V_te), size=min(n_eval, len(V_te)), replace=False)
-    qs_sub = np.stack([
-        _bellman_q(s, transition_function, mdp[2], mdp[0], mdp[1], gamma, np.random.default_rng(PROBE_SEED + 3))
-        for s in data["s_curr_test"][sub]
-    ])
-    a_star = np.argmax(qs_sub, axis=1)
-    rows_idx = np.arange(len(sub))
-
-    def bellman_regret(a_hat_sub: np.ndarray) -> float:
-        return float(np.mean(qs_sub[rows_idx, a_star] - qs_sub[rows_idx, a_hat_sub]))
-
-    rng_pol = np.random.default_rng(PROBE_SEED + 4)
-    zero_idx = int(np.argmin(np.linalg.norm(ACTION_GRID, axis=1)))
-
-    header = (f"{'Policy / Extractor':<30} | {'Bellman Regret':>14} | {'pi* Accuracy %':>13} | "
+    header = (f"{'Policy / Extractor':<30} | {'MC Bellman Regret':>17} | {'pi* Accuracy %':>14} | "
               f"{'V* Within R2':>12} | {'V* Pooled R2':>12}")
     print(header)
     print("-" * len(header))
-    print(f"{'Oracle (value iteration)':<30} | {0.0:>14.4f} | {100.0:>13.1f} | {'—':>12} | {'—':>12}")
+    print(f"{'Oracle (value iteration)':<30} | {0.0:>17.4f} | {100.0:>14.1f} | {'—':>12} | {'—':>12}")
     for name, (Z_tr, Z_te) in feats.items():
-        F_tr = np.hstack([Z_tr, act_tr])
-        F_te = np.hstack([Z_te, act_te])
-        pi_hat = fit_predict_probe(F_tr, onehot[pi_tr], F_te, probe_type="ridge", seed=PROBE_SEED)
-        a_hat = np.argmax(pi_hat, axis=1)
+        F_tr, F_te = _probe_inputs(Z_tr, Z_te, data)
+        a_hat = np.argmax(fit_predict_probe(F_tr, onehot[pi_tr], F_te, probe_type="ridge", seed=PROBE_SEED), axis=1)
         v_hat = fit_predict_probe(F_tr, V_tr, F_te, probe_type="ridge", seed=PROBE_SEED)
-        print(
-            f"{name:<30} | {bellman_regret(a_hat[sub]):>14.4f} | "
-            f"{100.0 * np.mean(a_hat == pi_te):>13.1f} | "
-            f"{within_asset_r2(V_te, v_hat, asset_te):>12.3f} | {r2_score(V_te, v_hat):>12.3f}"
-        )
-    print(f"{'Random action':<30} | {bellman_regret(rng_pol.integers(len(ACTION_GRID), size=len(sub))):>14.4f} | "
-          f"{100.0 / len(ACTION_GRID):>13.1f} | {'—':>12} | {'—':>12}")
-    print(f"{'Zero action (do nothing)':<30} | {bellman_regret(np.full(len(sub), zero_idx)):>14.4f} | "
-          f"{100.0 * np.mean(pi_te == zero_idx):>13.1f} | {'—':>12} | {'—':>12}")
+        print(f"{name:<30} | {_bellman_regret(Q_te, a_hat):>17.4f} | {100.0 * np.mean(a_hat == pi_te):>14.1f} | "
+              f"{within_asset_r2(V_te, v_hat, asset_te):>12.3f} | {r2_score(V_te, v_hat):>12.3f}")
+    rand_a = np.random.default_rng(PROBE_SEED + 4).integers(len(ACTION_GRID), size=len(Q_te))
+    zero_a = np.full(len(Q_te), ZERO_ACTION)
+    print(f"{'Random action':<30} | {_bellman_regret(Q_te, rand_a):>17.4f} | "
+          f"{100.0 * np.mean(rand_a == pi_te):>14.1f} | {'—':>12} | {'—':>12}")
+    print(f"{'Zero action (do nothing)':<30} | {_bellman_regret(Q_te, zero_a):>17.4f} | "
+          f"{100.0 * np.mean(zero_a == pi_te):>14.1f} | {'—':>12} | {'—':>12}")
     print("-" * len(header))
 
 
 # %%
 # ============================================================================
-# EXPERIMENT G: DYNAMICS SHIFT — is optimal behavior SAVED when the transition
-# function changes to one that steers states AWAY from the original central
-# mass? g_shift adds linear repulsion (kappa) from the original (l, m) mean.
-# A-trained extractors and probes are transferred to the shifted panel
-# (state recovery + Bellman regret under the shifted MDP's oracle), compared
-# against extractors/probes retrained on the shifted panel.
+# EXPERIMENT G: DYNAMICS SHIFT — is optimal behavior saved when the world changes to
+# g_shift = g + kappa * tanh(s - center) on (l, m): a BOUNDED (saturating) repulsion
+# from the original central mass, so the shifted world stays stationary?
+# Transfer rows: A-trained extractors and probes applied to B, with B's features normalized
+# by A's training statistics. Refit rows: Random Linear / Untrained keep the SAME frozen
+# extractor and only refit the probes on B; JEPA Cluster is retrained on B.
 # ============================================================================
 
-def run_experiment_g_dynamics_shift(panel_A, device: str = "cpu", cache: dict = None, H: int = 5,
-                                    kappa: float = 0.10, gamma: float = 0.9, n_eval: int = 3000):
+def run_experiment_g_dynamics_shift(panel_A, world: World, device: str = "cpu", cache: dict = None,
+                                    H: int = 5, kappa: float = 0.10, gamma: float = 0.9):
     print("\n" + "=" * 108)
     print("TABLE 7 | EXPERIMENT G: DYNAMICS SHIFT — IS OPTIMAL BEHAVIOR SAVED WHEN THE TRANSITION FUNCTION")
-    print(f"         STEERS STATES AWAY FROM THE ORIGINAL CENTRAL MASS? (g_shift = g + saturating tanh")
-    print(f"         repulsion kappa = {kappa} from the original (l, m) mean; regret scored under the shifted MDP's oracle)")
+    print(f"         STEERS STATES AWAY FROM THE ORIGINAL CENTRAL MASS? ({world.name} DGP; g_shift = g + bounded")
+    print(f"         tanh repulsion, kappa = {kappa}, from the original (l, m) mean; regret under the shifted MDP)")
     print("=" * 108)
 
     center = panel_A["states"].reshape(-1, 3).mean(axis=0)
-    repel = np.array([kappa, kappa, 0.0], dtype=np.float32)
+    repel = np.array([kappa, kappa, 0.0])
 
     def g_shift(s, a, beta):
-        # Saturating repulsion: the central mass is evacuated but the force is bounded, so the
-        # shifted world stays stationary. (Linear repulsion compounds with g's persistence and
-        # diverges geometrically -> float32 overflow -> NaN returns/features -> KMeans crash.)
-        s_next = transition_function(s, a, beta)
-        return s_next + (repel * np.tanh(s - center)).astype(np.float32)
+        # Saturating repulsion: bounded force keeps the shifted world stationary. (Linear repulsion
+        # compounds with g's persistence and diverges -> float32 overflow -> NaN features.)
+        return world.g(s, a, beta) + (repel.astype(np.float32) * np.tanh(s - center)).astype(np.float32)
+
+    def g_shift_vec(S, A, beta):
+        return world.g_vec(S, A, beta) + repel * np.tanh(np.asarray(S, dtype=np.float64) - center)
 
     cfg = SimConfig(n_assets=N_ASSETS, n_days=N_DAYS, context_len=CONTEXT_LEN)
-    panel_B = generate_panel_with_interventions(cfg, seed=PANEL_SEED, state_noise=NOISE_LEVELS["medium"], transition_fn=g_shift)
-    data_A = build_horizon_dataset(panel_A, context_len=CONTEXT_LEN, horizon=H, train_end_day=TRAIN_END_DAY)
-    data_B = build_horizon_dataset(panel_B, context_len=CONTEXT_LEN, horizon=H, train_end_day=TRAIN_END_DAY)
-    feats_A = build_extractor_features(data_A, "medium", H, device=device, cache=cache)
-    models = EXTRACTOR_MODELS[("medium", H)]
+    panel_B = generate_panel_with_interventions(cfg, seed=PANEL_SEED, state_noise=NOISE_LEVELS["medium"],
+                                                transition_fn=g_shift)
+    kw = dict(context_len=CONTEXT_LEN, horizon=H, train_end_day=TRAIN_END_DAY)
+    data_A = build_horizon_dataset(panel_A, transition_fn=world.g, **kw)
+    data_B = build_horizon_dataset(panel_B, transition_fn=g_shift, **kw)                 # refit rows
+    data_Bx = build_horizon_dataset(panel_B, transition_fn=g_shift,
+                                    norm_stats=data_A["norm_stats"], **kw)               # transfer rows
+    assert np.array_equal(data_B["date_test"], data_Bx["date_test"])
 
-    if "A" not in _MDP_CACHE:
-        _MDP_CACHE["A"] = _solve_mdp(panel_A, gamma=gamma)
-    if "B" not in _MDP_CACHE:
-        _MDP_CACHE["B"] = _solve_mdp(panel_B, transition_fn=g_shift, gamma=gamma)
-    mdp_A, mdp_B = _MDP_CACHE["A"], _MDP_CACHE["B"]
+    feats_A = build_extractor_features(data_A, _world_key(world), H, device=device, cache=cache)
+    models = EXTRACTOR_MODELS[(_world_key(world), H)]
+    if world.name not in _MDP_CACHE:
+        _MDP_CACHE[world.name] = _solve_mdp(panel_A, world.g_vec, gamma=gamma)
+    mdp_A = _MDP_CACHE[world.name]
+    mdp_B = _solve_mdp(panel_B, g_shift_vec, gamma=gamma)
 
-    V_B_tr, pi_B_tr = _mdp_targets(data_B["s_curr_train"], mdp_B, g_shift, gamma)
-    V_B_te, pi_B_te = _mdp_targets(data_B["s_curr_test"], mdp_B, g_shift, gamma)
-    V_A_tr, pi_A_tr = _mdp_targets(data_A["s_curr_train"], mdp_A, None, gamma)
-
-    rng_sub = np.random.default_rng(PROBE_SEED + 5)
-    sub = rng_sub.choice(len(V_B_te), size=min(n_eval, len(V_B_te)), replace=False)
-    qs_B = np.stack([
-        _bellman_q(s, g_shift, mdp_B[2], mdp_B[0], mdp_B[1], gamma, np.random.default_rng(PROBE_SEED + 6))
-        for s in data_B["s_curr_test"][sub]
-    ])
-    a_star_B = np.argmax(qs_B, axis=1)
-    rows_idx = np.arange(len(sub))
-
-    def regret_B(a_hat_sub: np.ndarray) -> float:
-        return float(np.mean(qs_B[rows_idx, a_star_B] - qs_B[rows_idx, a_hat_sub]))
+    _, pi_A_tr, _ = _policy_targets(data_A, "train", mdp_A, world.g_vec, n_samples=64, seed=PROBE_SEED + 5)
+    _, pi_B_tr, _ = _policy_targets(data_B, "train", mdp_B, g_shift_vec, n_samples=64, seed=PROBE_SEED + 6)
+    _, pi_B_te, Q_B_te = _policy_targets(data_B, "test", mdp_B, g_shift_vec, n_samples=64, seed=PROBE_SEED + 7)
 
     onehot = np.eye(len(ACTION_GRID), dtype=np.float32)
-    act_A_tr, act_B_tr, act_B_te = data_A["act_train"], data_B["act_train"], data_B["act_test"]
-    asset_B_te, s_hor_A_tr, s_hor_B_tr, s_hor_B_te = (
-        data_B["asset_test"], data_A["s_hor_train"], data_B["s_hor_train"], data_B["s_hor_test"]
-    )
+    s_hor_A_tr, s_hor_B_tr, s_hor_B_te = data_A["s_hor_train"], data_B["s_hor_train"], data_B["s_hor_test"]
+    asset_B_te = data_B["asset_test"]
 
-    # Retrained-on-B extractors: JEPA trained on B; untrained re-drawn; projector frozen
-    set_seed(100)
-    untr_B_enc = TimeSeriesEncoder(mag_preserving=True).to(device)
-    untr_B_pred = LatentPredictor(embed_dim=untr_B_enc.out_dim, action_dim=0).to(device)
     jepa_B_enc, jepa_B_pred = train_jepa_model(
-        data_B["X_ctx_train"], data_B["X_fut_train"], act_B_tr, use_action_predictor=False,
+        data_B["X_ctx_train"], data_B["X_fut_train"], data_B["act_train"], use_action_predictor=False,
         use_cluster_sampler=True, mag_preserving=True, epochs=JEPA_EPOCHS, seed=PROBE_SEED, device=device,
     )
 
-    def transfer_features(name):
-        if name == "Random Linear":
-            return extract_representations(models["proj"], models["id_pred"], data_B["X_ctx_test"], device=device)
-        if name == "Untrained Conv+Transformer":
-            enc_m, pred_m = models["untrained"]
-            return extract_representations(enc_m, pred_m, data_B["X_ctx_test"], device=device)
-        enc_m, pred_m = models["jepa"]
-        return extract_representations(enc_m, pred_m, data_B["X_ctx_test"], device=device)
+    def rep(model, X):
+        return extract_representations(model[0], model[1], X, device=device)
 
-    def retrain_features(name):
-        if name == "Random Linear":
-            return (
-                extract_representations(models["proj"], models["id_pred"], data_B["X_ctx_train"], device=device),
-                extract_representations(models["proj"], models["id_pred"], data_B["X_ctx_test"], device=device),
-            )
-        if name == "Untrained Conv+Transformer":
-            return (
-                extract_representations(untr_B_enc, untr_B_pred, data_B["X_ctx_train"], device=device),
-                extract_representations(untr_B_enc, untr_B_pred, data_B["X_ctx_test"], device=device),
-            )
-        return (
-            extract_representations(jepa_B_enc, jepa_B_pred, data_B["X_ctx_train"], device=device),
-            extract_representations(jepa_B_enc, jepa_B_pred, data_B["X_ctx_test"], device=device),
-        )
+    def score(F_tr, pi_tr, s_tr, F_te):
+        a_hat = np.argmax(fit_predict_probe(F_tr, onehot[pi_tr], F_te, probe_type="ridge", seed=PROBE_SEED), axis=1)
+        s_hat = fit_predict_probe(F_tr, s_tr, F_te, probe_type="ridge", seed=PROBE_SEED)
+        return _bellman_regret(Q_B_te, a_hat), 100.0 * np.mean(a_hat == pi_B_te), within_asset_r2(s_hor_B_te, s_hat, asset_B_te)
 
-    header = (f"{'Policy (B-world)':<40} | {'Bellman Regret':>14} | {'pi*_B Acc %':>11} | {'State R2':>9}")
+    header = f"{'Policy (B-world)':<40} | {'MC Bellman Regret':>17} | {'pi*_B Acc %':>11} | {'State R2':>9}"
     print(f"Shift center (original l, m mean): ({center[0]:.3f}, {center[1]:.3f}); kappa = {kappa}")
     print(header)
     print("-" * len(header))
-    print(f"{'Oracle-B (value iteration on g_shift)':<40} | {0.0:>14.4f} | {100.0:>11.1f} | {'—':>9}")
+    print(f"{'Oracle-B (value iteration on g_shift)':<40} | {0.0:>17.4f} | {100.0:>11.1f} | {'—':>9}")
 
     for name, (Z_A_tr, _) in feats_A.items():
-        Z_B_te = transfer_features(name)
-        F_A_tr = np.hstack([Z_A_tr, act_A_tr])
-        F_B_te = np.hstack([Z_B_te, act_B_te])
+        F_A_tr = np.hstack([Z_A_tr, data_A["act_train"]])
+        F_Bx_te = np.hstack([rep(models[name], data_Bx["X_ctx_test"]), data_Bx["act_test"]])
+        regret, acc, r2 = score(F_A_tr, pi_A_tr, s_hor_A_tr, F_Bx_te)
+        print(f"{f'{name}  A->B transferred':<40} | {regret:>17.4f} | {acc:>11.1f} | {r2:>9.3f}")
 
-        pi_hat = fit_predict_probe(F_A_tr, onehot[pi_A_tr], F_B_te, probe_type="ridge", seed=PROBE_SEED)
-        a_hat = np.argmax(pi_hat, axis=1)
-        s_hat = fit_predict_probe(F_A_tr, s_hor_A_tr, F_B_te, probe_type="ridge", seed=PROBE_SEED)
-        r2_transfer = within_asset_r2(s_hor_B_te, s_hat, asset_B_te)
-        print(f"{f'{name}  A->B transferred':<40} | {regret_B(a_hat[sub]):>14.4f} | "
-              f"{100.0 * np.mean(a_hat == pi_B_te):>11.1f} | {r2_transfer:>9.3f}")
+        model_B = (jepa_B_enc, jepa_B_pred) if name == "JEPA Cluster" else models[name]
+        label = "retrained on B" if name == "JEPA Cluster" else "probes refit on B"
+        F_B_tr = np.hstack([rep(model_B, data_B["X_ctx_train"]), data_B["act_train"]])
+        F_B_te = np.hstack([rep(model_B, data_B["X_ctx_test"]), data_B["act_test"]])
+        regret, acc, r2 = score(F_B_tr, pi_B_tr, s_hor_B_tr, F_B_te)
+        print(f"{f'{name}  {label}':<40} | {regret:>17.4f} | {acc:>11.1f} | {r2:>9.3f}")
 
-        Z_B_tr, Z_B_te2 = retrain_features(name)
-        F_B_tr = np.hstack([Z_B_tr, act_B_tr])
-        F_B_te2 = np.hstack([Z_B_te2, act_B_te])
-        pi_hat2 = fit_predict_probe(F_B_tr, onehot[pi_B_tr], F_B_te2, probe_type="ridge", seed=PROBE_SEED)
-        a_hat2 = np.argmax(pi_hat2, axis=1)
-        s_hat2 = fit_predict_probe(F_B_tr, s_hor_B_tr, F_B_te2, probe_type="ridge", seed=PROBE_SEED)
-        r2_retrain = within_asset_r2(s_hor_B_te, s_hat2, asset_B_te)
-        print(f"{f'{name}  retrained on B':<40} | {regret_B(a_hat2[sub]):>14.4f} | "
-              f"{100.0 * np.mean(a_hat2 == pi_B_te):>11.1f} | {r2_retrain:>9.3f}")
-
-    rng_pol = np.random.default_rng(PROBE_SEED + 7)
-    zero_idx = int(np.argmin(np.linalg.norm(ACTION_GRID, axis=1)))
-    print(f"{'Random action':<40} | {regret_B(rng_pol.integers(len(ACTION_GRID), size=len(sub))):>14.4f} | "
-          f"{100.0 / len(ACTION_GRID):>11.1f} | {'—':>9}")
-    print(f"{'Zero action (do nothing)':<40} | {regret_B(np.full(len(sub), zero_idx)):>14.4f} | "
-          f"{100.0 * np.mean(pi_B_te == zero_idx):>11.1f} | {'—':>9}")
+    rand_a = np.random.default_rng(PROBE_SEED + 8).integers(len(ACTION_GRID), size=len(Q_B_te))
+    zero_a = np.full(len(Q_B_te), ZERO_ACTION)
+    print(f"{'Random action':<40} | {_bellman_regret(Q_B_te, rand_a):>17.4f} | "
+          f"{100.0 * np.mean(rand_a == pi_B_te):>11.1f} | {'—':>9}")
+    print(f"{'Zero action (do nothing)':<40} | {_bellman_regret(Q_B_te, zero_a):>17.4f} | "
+          f"{100.0 * np.mean(zero_a == pi_B_te):>11.1f} | {'—':>9}")
     print("-" * len(header))
 
 
 # %%
 # ============================================================================
-# MAIN - build the three noise panels and run all seven tables.
-# In Colab (notebook mode or !python) __name__ == "__main__", so Run all works.
+# MAIN
 # ============================================================================
 
 if __name__ == "__main__":
+    # Determinism (v3 Experiment C drifted between GPU runs). The cuBLAS setting must be in
+    # place before the first CUDA call; warn_only keeps ops without a deterministic kernel running.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Running Study 3 ablations on device={device} (TabICL installed={HAS_TABICL})")
+    world = make_world(ARGS.decision_dgp)
+    print(f"Running Study 3 ablations on device={device} | seed={PROBE_SEED} | decision DGP={world.name} | "
+          f"probe={'TabICL' if HAS_TABICL else 'RBF fallback (tabicl NOT installed)'}"
+          f"{' | QUICK SMOKE TEST' if ARGS.quick else ''}")
     cfg = SimConfig(n_assets=N_ASSETS, n_days=N_DAYS, context_len=CONTEXT_LEN)
 
+    # Ablations A/B: the original DGP at three noise levels (same panels as Experiments 1-2)
     panels = {
         noise_name: generate_panel_with_interventions(cfg, seed=PANEL_SEED, state_noise=noise)
         for noise_name, noise in NOISE_LEVELS.items()
     }
+    # Experiments C-G: the decision DGP at medium noise
+    decision_panel = panels["medium"] if world.name == "original" else generate_panel_with_interventions(
+        cfg, seed=PANEL_SEED, state_noise=NOISE_LEVELS["medium"], transition_fn=world.g)
+
+    print("DGP diagnostics (medium noise):")
+    print_dgp_diagnostics("original", panels["medium"])
+    if world.name != "original":
+        print_dgp_diagnostics(world.name, decision_panel)
 
     feature_cache = {}
     run_ablation_a_random_baseline(panels["medium"], device=device, cache=feature_cache)
     run_ablation_b_order_recovery(panels, device=device, cache=feature_cache)
-    run_experiment_c_belief_planning(panels["medium"], device=device)
-    run_experiment_d_portfolio(panels["medium"], device=device, cache=feature_cache)
-    run_experiment_e_lp_scaling(panels["medium"], device=device, cache=feature_cache)
-    run_experiment_f_rl_emulation(panels["medium"], device=device, cache=feature_cache)
-    run_experiment_g_dynamics_shift(panels["medium"], device=device, cache=feature_cache)
+    run_experiment_c_belief_planning(decision_panel, world, device=device)
+    run_experiment_d_portfolio(decision_panel, world, device=device, cache=feature_cache)
+    run_experiment_e_lp_scaling(decision_panel, world, device=device, cache=feature_cache)
+    run_experiment_f_rl_emulation(decision_panel, world, device=device, cache=feature_cache)
+    run_experiment_g_dynamics_shift(decision_panel, world, device=device, cache=feature_cache)
